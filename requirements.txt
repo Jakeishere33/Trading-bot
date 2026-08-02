@@ -3,5 +3,5 @@ numpy
 pandas
 yfinance
 scipy
-alpaca-trade-api
+alpaca-py
 vaderSentiment
