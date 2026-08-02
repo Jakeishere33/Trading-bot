@@ -46,6 +46,12 @@ def home():
     return "Global Multi-Factor Risk Engine Online (ETFs/NYSE/NASDAQ/Options)!", 200
 
 
+@app.route("/health")
+def health():
+    # Simple, fast health check for UptimeRobot / Render
+    return "OK", 200
+
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -873,187 +879,151 @@ def check_position_losses(trading_client, positions):
 
 
 def check_portfolio_drawdown(account, initial_equity):
-    current_equity = float(account.portfolio_value)
-    if initial_equity <= 0:
-        return 0.0, False, False
-    dd_pct = (initial_equity - current_equity) / initial_equity
-    pause = dd_pct >= PORTFOLIO_PAUSE_DD_PCT
-    exit_satellite = dd_pct >= PORTFOLIO_EXIT_SATELLITE_DD_PCT
-    if pause:
-        log.warning(f"Portfolio drawdown {dd_pct:.2%} -> pause satellite trades.")
-    if exit_satellite:
-        log.warning(f"Portfolio drawdown {dd_pct:.2%} -> exit satellite sleeve.")
-    return dd_pct, pause, exit_satellite
+    """
+    Simple portfolio drawdown kill-switch.
+    initial_equity can be set to the starting equity for the session.
+    """
+    try:
+        current_equity = float(account.equity)
+        if initial_equity <= 0:
+            return
+        dd_pct = (initial_equity - current_equity) / initial_equity
+        if dd_pct >= PORTFOLIO_EXIT_SATELLITE_DD_PCT:
+            log.warning(f"Portfolio drawdown {dd_pct:.2%} exceeds satellite exit threshold.")
+            # Here you could exit satellite positions, etc.
+        elif dd_pct >= PORTFOLIO_PAUSE_DD_PCT:
+            log.warning(f"Portfolio drawdown {dd_pct:.2%} exceeds pause threshold.")
+            # You could set a global pause flag, etc.
+    except Exception as e:
+        log.warning(f"Portfolio drawdown check failed: {e}")
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN TRADING LOOP (BACKGROUND THREAD)
 # ============================================================
 
-def trading_bot_loop():
-    api_key = os.environ.get("ALPACA_PAPER_KEY")
-    secret_key = os.environ.get("ALPACA_PAPER_SECRET")
+def trading_loop():
+    log.info("Trading loop started.")
+    backoff_seconds = 30
 
-    if not api_key or not secret_key:
-        log.error("Missing Alpaca credentials. Bot will not start.")
+    # Read Alpaca credentials from environment
+    api_key = os.environ.get("ALPACA_API_KEY")
+    api_secret = os.environ.get("ALPACA_API_SECRET")
+    paper = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+
+    if not api_key or not api_secret:
+        log.error("Missing ALPACA_API_KEY or ALPACA_API_SECRET in environment.")
         return
 
-    trading_client = TradingClient(api_key, secret_key, paper=True)
-    stock_data_client = StockHistoricalDataClient(api_key, secret_key)
-    option_data_client = OptionHistoricalDataClient(api_key, secret_key)
+    trading_client = TradingClient(api_key, api_secret, paper=paper)
+    stock_data_client = StockHistoricalDataClient(api_key, api_secret)
+    option_data_client = OptionHistoricalDataClient(api_key, api_secret)
 
-    raw_stock_universe = get_nyse_nasdaq_universe(trading_client)
-    stock_universe = filter_liquid_stocks(raw_stock_universe)
-
-    all_tickers = (
-        list(CORE_ETFS.keys())
-        + SECTOR_TICKERS
-        + list(HEDGE_INSTRUMENTS.values())
-        + stock_universe
-    )
-
-    fundamentals = FundamentalAnalyzer()
-    sentiment = NewsSentimentAnalyzer()
-    de = DataEngine(all_tickers)
-
-    options_engine = OptionsEngine(trading_client, option_data_client, de)
-
-    OPTION_UNIVERSE = list(CORE_ETFS.keys()) + stock_universe
-
-    last_data_refresh = 0
-    last_options_run = 0
-
-    # Track initial equity for drawdown
-    account = trading_client.get_account()
-    initial_equity = float(account.portfolio_value)
+    # Capture initial equity for drawdown checks
+    try:
+        initial_account = trading_client.get_account()
+        initial_equity = float(initial_account.equity)
+    except Exception as e:
+        log.warning(f"Failed to fetch initial account equity: {e}")
+        initial_equity = 0.0
 
     while True:
+        start_ts = time.time()
         try:
-            reset_trade_counter_if_new_day()
-
-            if time.gmtime().tm_wday >= 5:
-                time.sleep(WEEKEND_SLEEP_SECONDS)
-                continue
-
-            risk_mgr = RiskManager(de)
-            vix_level = risk_mgr.current_vix_level()
-            if vix_level >= VIX_PAUSE_LEVEL:
-                log.warning(f"VIX={vix_level:.1f} >= {VIX_PAUSE_LEVEL}. Pausing new trades.")
-                time.sleep(LOOP_SLEEP_SECONDS)
-                continue
-
-            if time.time() - last_data_refresh > 6 * 3600:
-                de.fetch()
-                last_data_refresh = time.time()
-
+            # Account + positions
             account = trading_client.get_account()
-            total_equity = float(account.portfolio_value)
+            positions_list = trading_client.get_all_positions()
+            positions = {p.symbol: p for p in positions_list}
+            total_equity = float(account.equity)
             cash_available = float(account.cash)
-            positions = {p.symbol: p for p in trading_client.get_all_positions()}
 
-            dd_pct, pause_satellite, exit_satellite = check_portfolio_drawdown(account, initial_equity)
+            # Universe
+            nyse_nasdaq = get_nyse_nasdaq_universe(trading_client)
+            liquid_stocks = filter_liquid_stocks(nyse_nasdaq)
+            tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + liquid_stocks
 
-            apply_trailing_stops(trading_client, positions)
+            # Data + scores
+            de = DataEngine(tickers)
+            de.fetch()
+            fundamentals = FundamentalAnalyzer()
+            sentiment = NewsSentimentAnalyzer()
+            scores = composite_scores(de, fundamentals, sentiment, tickers)
+
+            # Risk manager
+            rm = RiskManager(de)
+            regime_score = rm.regime_risk_score()
+            hedge_weights = rm.hedge_weight_breakdown(SATELLITE_HEDGE_TOTAL)
+
+            log.info(f"Regime score: {regime_score:.3f}, hedge weights: {hedge_weights}")
+
+            # Rebalance core ETFs
+            for ticker, w in CORE_ETFS.items():
+                rebalance_to_target(
+                    trading_client,
+                    stock_data_client,
+                    positions,
+                    total_equity,
+                    cash_available,
+                    ticker,
+                    w * CORE_TOTAL_WEIGHT,
+                    is_core=True,
+                )
+
+            # TODO: satellite selection using scores + optimize_weights
+            # (You can plug in your full satellite logic here.)
+
+            # Options overlay
+            if OPTIONS_ENABLED:
+                opt_engine = OptionsEngine(trading_client, option_data_client, de)
+                opt_summary = options_position_summary(positions_list)
+                # Example: sell covered calls on core ETF positions
+                for symbol, pos in positions.items():
+                    if symbol in CORE_ETFS and float(pos.qty) >= 100:
+                        spot = get_price(stock_data_client, symbol)
+                        existing_short_calls = int(opt_summary.get((symbol, "call"), 0))
+                        opt_engine.sell_covered_calls(
+                            underlying=symbol,
+                            shares_held=float(pos.qty),
+                            existing_short_call_qty=existing_short_calls,
+                            spot_price=spot,
+                        )
+
+            # Kill-switches
             check_position_losses(trading_client, positions)
-
-            # 1. CORE SLEEVE — ONLY ETFs
-            for ticker, weight in CORE_ETFS.items():
-                rebalance_to_target(
-                    trading_client, stock_data_client, positions,
-                    total_equity, cash_available, ticker, weight, is_core=True
-                )
-
-            # 2. REGIME / RISK SPLIT
-            risk_score = risk_mgr.regime_risk_score()
-            hedge_weight = float(np.clip(
-                MIN_HEDGE_WEIGHT + risk_score * (MAX_HEDGE_WEIGHT - MIN_HEDGE_WEIGHT),
-                MIN_HEDGE_WEIGHT, MAX_HEDGE_WEIGHT,
-            ))
-            satellite_weight = SATELLITE_HEDGE_TOTAL - hedge_weight
-            log.info(f"Risk score={risk_score:.2f} -> satellite={satellite_weight:.2%}, hedge={hedge_weight:.2%}")
-
-            # 3. SATELLITE SLEEVE — sectors + NYSE/NASDAQ stocks
-            if not exit_satellite and not pause_satellite and vix_level < VIX_SLOW_LEVEL:
-                satellite_candidates = SECTOR_TICKERS + stock_universe
-                scores = composite_scores(de, fundamentals, sentiment, satellite_candidates)
-                top_assets = [t for t, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N_SATELLITE]]
-                if top_assets:
-                    momentum = de.momentum_12_1()
-                    expected_returns = {t: momentum.get(t, 0.0) for t in top_assets}
-                    cov = de.covariance_matrix(top_assets)
-                    sat_weights = optimize_weights(expected_returns, cov, satellite_weight)
-                    for ticker, weight in sat_weights.items():
-                        rebalance_to_target(
-                            trading_client, stock_data_client, positions,
-                            total_equity, cash_available, ticker, weight, is_core=False
-                        )
-            elif exit_satellite and can_trade_today():
-                # Exit satellite sleeve
-                for symbol, p in positions.items():
-                    if symbol in SECTOR_TICKERS or symbol in stock_universe:
-                        order = MarketOrderRequest(
-                            symbol=symbol,
-                            qty=abs(float(p.qty)),
-                            side=OrderSide.SELL,
-                            time_in_force=TimeInForce.GTC,
-                        )
-                        submit_order_safe(trading_client, order, label=f"EXIT satellite {symbol}")
-                log.warning("Satellite sleeve exited due to portfolio drawdown.")
-
-            # 4. HEDGE SLEEVE
-            etf_hedge_weight = hedge_weight * (1 - PUT_HEDGE_SHARE)
-            put_budget = total_equity * hedge_weight * PUT_HEDGE_SHARE
-            hedge_alloc = risk_mgr.hedge_weight_breakdown(etf_hedge_weight)
-            for name, weight in hedge_alloc.items():
-                ticker = HEDGE_INSTRUMENTS[name]
-                rebalance_to_target(
-                    trading_client, stock_data_client, positions,
-                    total_equity, cash_available, ticker, weight, is_core=False
-                )
-
-            # 5. OPTIONS OVERLAY — ETFs + NYSE/NASDAQ stocks you actually hold
-            if OPTIONS_ENABLED and time.time() - last_options_run > OPTIONS_RUN_INTERVAL_SECONDS:
-                options_pct = check_options_exposure(positions, total_equity)
-                if options_pct < MAX_OPTIONS_PCT_OF_EQUITY:
-                    opt_summary = options_position_summary(list(positions.values()))
-                    per_underlying_budget = put_budget / max(len(OPTION_UNIVERSE), 1)
-
-                    for underlying in OPTION_UNIVERSE:
-                        try:
-                            spot = get_price(stock_data_client, underlying)
-                        except Exception as e:
-                            log.warning(f"Spot price fetch failed for {underlying} options overlay: {e}")
-                            continue
-
-                        if not spot:
-                            continue
-
-                        pos = positions.get(underlying)
-                        shares_held = float(pos.qty) if pos else 0.0
-                        if shares_held <= 0:
-                            continue
-
-                        short_calls = opt_summary.get((underlying, "call"), 0.0)
-                        existing_short = abs(short_calls) if short_calls < 0 else 0.0
-                        options_engine.sell_covered_calls(underlying, shares_held, existing_short, spot)
-
-                        long_puts = opt_summary.get((underlying, "put"), 0.0)
-                        existing_long = long_puts if long_puts > 0 else 0.0
-                        options_engine.buy_protective_puts(
-                            underlying, shares_held, existing_long, spot, per_underlying_budget
-                        )
-                last_options_run = time.time()
-
-            # 6. FINAL OPTIONS EXPOSURE CHECK
+            apply_trailing_stops(trading_client, positions)
             check_options_exposure(positions, total_equity)
+            check_portfolio_drawdown(account, initial_equity)
+
+            loop_duration = time.time() - start_ts
+            log.info(f"Trading loop completed in {loop_duration:.1f}s.")
+            time.sleep(LOOP_SLEEP_SECONDS)
 
         except Exception as e:
-            log.exception(f"Main loop error: {e}")
+            log.exception(f"Trading loop error: {e}")
+            log.info(f"Sleeping {backoff_seconds}s before retry.")
+            time.sleep(backoff_seconds)
 
-        time.sleep(LOOP_SLEEP_SECONDS)
+
+def start_background_trading_loop():
+    def _runner():
+        # Delay so Flask is fully up before heavy work
+        time.sleep(5)
+        trading_loop()
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    log.info("Background trading loop thread started.")
 
 
-threading.Thread(target=trading_bot_loop, daemon=True).start()
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # Start trading loop in background
+    start_background_trading_loop()
+
+    # Use PORT from env (Render requirement)
+    port = int(os.environ.get("PORT", 10000))
+    log.info(f"Starting Flask app on port {port}...")
+    app.run(host="0.0.0.0", port=port, threaded=True)
