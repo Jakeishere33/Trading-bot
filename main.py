@@ -669,4 +669,4 @@ threading.Thread(target=trading_bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
     # Render assigns the port dynamically via $PORT — don't hardcode it.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT",
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
