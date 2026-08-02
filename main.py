@@ -50,14 +50,14 @@ def home():
 # CONFIG
 # ============================================================
 
-HISTORY_YEARS = 12          # 10+ years of history for every ticker
+HISTORY_YEARS = 12
 RISK_FREE_ANNUAL = 0.04
 TRADING_DAYS = 252
 
-CORE_ETFS = {                       # 70% of the account, fixed weights
-    "VOO": 0.45,                    # US broad market
-    "VXUS": 0.15,                   # Ex-US developed + EM broad market
-    "BND": 0.10,                    # Broad US bonds
+CORE_ETFS = {
+    "VOO": 0.45,
+    "VXUS": 0.15,
+    "BND": 0.10,
 }
 CORE_TOTAL_WEIGHT = 0.70
 
@@ -87,20 +87,20 @@ REGIME_BENCHMARK = "VOO"
 VIX_TICKER = "^VIX"
 
 SATELLITE_HEDGE_TOTAL = 1.0 - CORE_TOTAL_WEIGHT   # 0.30
-MIN_HEDGE_WEIGHT = 0.05
-MAX_HEDGE_WEIGHT = 0.25
+MIN_HEDGE_WEIGHT = 0.02
+MAX_HEDGE_WEIGHT = 0.07   # hedge < 7% of portfolio
 
 # --- Options overlay config ---
 OPTIONS_ENABLED = True
-COVERED_CALL_UNDERLYING = "VOO"     # income sleeve writes calls against this
-PROTECTIVE_PUT_UNDERLYING = "VOO"   # hedge sleeve buys puts against this
-CALL_OTM_PCT = 0.03                 # sell calls ~3% out of the money
-PUT_OTM_PCT = 0.07                  # buy puts ~7% out of the money
-OPTIONS_MIN_DTE = 25                # target 25-45 days to expiration
+COVERED_CALL_UNDERLYING = "VOO"
+PROTECTIVE_PUT_UNDERLYING = "VOO"
+CALL_OTM_PCT = 0.03
+PUT_OTM_PCT = 0.07
+OPTIONS_MIN_DTE = 25
 OPTIONS_MAX_DTE = 45
-PUT_HEDGE_SHARE = 0.25              # fraction of the hedge sleeve spent on puts vs TLT/GLD/SH
-OPTIONS_RUN_INTERVAL_SECONDS = 24 * 3600   # options chains only refreshed once/day
-MAX_OPTIONS_PCT_OF_EQUITY = 10.0
+PUT_HEDGE_SHARE = 0.25
+OPTIONS_RUN_INTERVAL_SECONDS = 24 * 3600
+MAX_OPTIONS_PCT_OF_EQUITY = 2.0   # options <= 2% of equity
 
 # Only these asset classes may ever receive an order from this bot.
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
@@ -110,16 +110,58 @@ REBALANCE_BAND = 0.05
 LOOP_SLEEP_SECONDS = 300
 WEEKEND_SLEEP_SECONDS = 1800
 
+# Position caps
+MAX_ETF_WEIGHT = 0.40       # no single ETF > 40%
+MAX_SECTOR_WEIGHT = 0.15    # no single sector > 15%
+
+# Option liquidity filters
+MIN_OPTION_VOLUME = 500
+MAX_OPTION_SPREAD_PCT = 0.15  # bid/ask spread <= 15% of mid
+
+# Trade limit
+MAX_TRADES_PER_DAY = 30
+TRADES_TODAY = 0
+LAST_TRADE_DAY = None
+
 
 # ============================================================
 # SAFETY GUARD — never trade currency/forex or anything off-universe
 # ============================================================
 
 def assert_safe_order(symbol: str, asset_class):
-    """Hard guardrail: block any order that isn't a plain US equity/ETF or a
-    listed US option on one. Currency/forex and crypto are never eligible."""
     if asset_class not in SAFE_ASSET_CLASSES:
         raise ValueError(f"Blocked order for {symbol}: asset class {asset_class} is not permitted (no forex/crypto).")
+
+
+# ============================================================
+# TRADE LIMIT / SUBMIT WRAPPER
+# ============================================================
+
+def reset_trade_counter_if_new_day():
+    global TRADES_TODAY, LAST_TRADE_DAY
+    today = date.today()
+    if LAST_TRADE_DAY != today:
+        LAST_TRADE_DAY = today
+        TRADES_TODAY = 0
+
+
+def can_trade_today() -> bool:
+    reset_trade_counter_if_new_day()
+    return TRADES_TODAY < MAX_TRADES_PER_DAY
+
+
+def submit_order_safe(trading_client: TradingClient, order_data, label: str = ""):
+    global TRADES_TODAY
+    reset_trade_counter_if_new_day()
+    if TRADES_TODAY >= MAX_TRADES_PER_DAY:
+        log.warning(f"Trade limit reached ({MAX_TRADES_PER_DAY} per day). Skipping order: {label}")
+        return
+    try:
+        trading_client.submit_order(order_data=order_data)
+        TRADES_TODAY += 1
+        log.info(f"Order submitted ({TRADES_TODAY}/{MAX_TRADES_PER_DAY} today): {label}")
+    except Exception as e:
+        log.exception(f"Order submission failed for {label}: {e}")
 
 
 # ============================================================
@@ -129,16 +171,6 @@ def assert_safe_order(symbol: str, asset_class):
 def black_scholes_price(
     S: float, K: float, T: float, r: float, sigma: float, option_type: str
 ) -> float:
-    """
-    Black–Scholes price for European calls/puts.
-
-    S: spot price
-    K: strike
-    T: time to expiration in years
-    r: risk-free rate (annual)
-    sigma: volatility (annual)
-    option_type: 'call' or 'put'
-    """
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
 
@@ -152,7 +184,7 @@ def black_scholes_price(
 
 
 # ============================================================
-# 1. DATA ENGINE — 12-year history, returns, Sharpe, momentum, vol
+# 1. DATA ENGINE
 # ============================================================
 
 class DataEngine:
@@ -226,7 +258,7 @@ def get_underlying_vol(data_engine: DataEngine, underlying: str, default_sigma: 
 
 
 # ============================================================
-# 2. FUNDAMENTAL / BALANCE-SHEET ANALYZER
+# 2. FUNDAMENTAL ANALYZER
 # ============================================================
 
 class FundamentalAnalyzer:
@@ -264,7 +296,7 @@ class FundamentalAnalyzer:
 
 
 # ============================================================
-# 3. NEWS SENTIMENT ANALYZER
+# 3. NEWS SENTIMENT
 # ============================================================
 
 class NewsSentimentAnalyzer:
@@ -380,8 +412,6 @@ class RiskManager:
         return float(np.mean(score_components)) if score_components else 0.3
 
     def hedge_weight_breakdown(self, hedge_total_weight):
-        """Splits the ETF portion of the hedge sleeve (bonds/gold/inverse equity).
-        Protective puts are budgeted separately in the main loop via PUT_HEDGE_SHARE."""
         vol = self.de.volatility()
         equity_vol = vol.get(REGIME_BENCHMARK, 0.15)
         if equity_vol > 0.22:
@@ -392,7 +422,7 @@ class RiskManager:
 
 
 # ============================================================
-# 7. OPTIONS ENGINE — covered calls (income) + protective puts (hedge)
+# 7. OPTIONS ENGINE
 # ============================================================
 
 OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
@@ -412,7 +442,6 @@ def parse_occ_symbol(symbol):
 
 
 def options_position_summary(positions):
-    """Returns {(underlying, 'call'|'put'): net_qty} where negative qty = short (written)."""
     summary = {}
     for p in positions:
         parsed = parse_occ_symbol(p.symbol)
@@ -459,6 +488,28 @@ class OptionsEngine:
             log.warning(f"Option quote failed for {symbol}: {e}")
             return None, None
 
+    def _option_liquidity_ok(self, contract, bid, ask):
+        # Volume filter
+        vol = getattr(contract, "volume", None)
+        if vol is None or vol < MIN_OPTION_VOLUME:
+            log.info(f"Skipping illiquid option {contract.symbol}: volume={vol}")
+            return False
+        # Spread filter
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return False
+        mid = (bid + ask) / 2.0
+        spread = ask - bid
+        if mid <= 0:
+            return False
+        spread_pct = spread / mid
+        if spread_pct > MAX_OPTION_SPREAD_PCT:
+            log.info(
+                f"Skipping wide-spread option {contract.symbol}: "
+                f"spread_pct={spread_pct:.2%} > {MAX_OPTION_SPREAD_PCT:.2%}"
+            )
+            return False
+        return True
+
     def _closest_strike(self, contracts, target_price):
         if not contracts:
             return None
@@ -468,8 +519,6 @@ class OptionsEngine:
         return contracts_sorted[0]
 
     def sell_covered_calls(self, underlying, shares_held, existing_short_call_qty, spot_price):
-        """Income sleeve: writes OTM calls against shares already held. Never sells
-        more contracts than shares/100 support, so this stays fully covered."""
         max_contracts = int(shares_held // 100)
         to_sell = max_contracts - existing_short_call_qty
         if to_sell <= 0 or spot_price <= 0:
@@ -491,8 +540,10 @@ class OptionsEngine:
             option_type="call",
         )
 
-        bid, _ = self._quote(contract.symbol)
+        bid, ask = self._quote(contract.symbol)
         use_price = bid if bid and bid > 0 else bs_price
+        if not self._option_liquidity_ok(contract, bid, ask):
+            return
         if use_price <= 0:
             return
 
@@ -504,15 +555,13 @@ class OptionsEngine:
             time_in_force=TimeInForce.DAY,
             limit_price=round(use_price, 2),
         )
-        self.trading.submit_order(order_data=order)
+        submit_order_safe(self.trading, order, label=f"SELL covered calls {contract.symbol}")
         log.info(
             f"SELL {to_sell} covered call(s) {contract.symbol} @ {use_price:.2f} "
             f"(BS={bs_price:.2f}, income sleeve)"
         )
 
     def buy_protective_puts(self, underlying, shares_to_hedge, existing_long_put_qty, spot_price, dollar_budget):
-        """Hedge sleeve: buys OTM puts sized to the underlying position, capped by
-        the dollar budget carved out of the overall hedge weight."""
         max_contracts = int(shares_to_hedge // 100)
         to_buy = max_contracts - existing_long_put_qty
         if to_buy <= 0 or spot_price <= 0 or dollar_budget <= 0:
@@ -534,8 +583,10 @@ class OptionsEngine:
             option_type="put",
         )
 
-        _, ask = self._quote(contract.symbol)
+        bid, ask = self._quote(contract.symbol)
         use_price = ask if ask and ask > 0 else bs_price
+        if not self._option_liquidity_ok(contract, bid, ask):
+            return
         if use_price <= 0:
             return
 
@@ -552,7 +603,7 @@ class OptionsEngine:
             time_in_force=TimeInForce.DAY,
             limit_price=round(use_price, 2),
         )
-        self.trading.submit_order(order_data=order)
+        submit_order_safe(self.trading, order, label=f"BUY protective puts {contract.symbol}")
         log.info(
             f"BUY {qty} protective put(s) {contract.symbol} @ {use_price:.2f} "
             f"(BS={bs_price:.2f}, hedge sleeve)"
@@ -560,7 +611,7 @@ class OptionsEngine:
 
 
 # ============================================================
-# 8. EXECUTION LAYER — stocks/ETFs (alpaca-py TradingClient)
+# 8. EXECUTION LAYER
 # ============================================================
 
 def get_price(stock_data_client, ticker):
@@ -569,7 +620,13 @@ def get_price(stock_data_client, ticker):
     return float(trade.price)
 
 
-def rebalance_to_target(trading_client, stock_data_client, positions, total_equity, cash_available, ticker, target_weight):
+def rebalance_to_target(trading_client, stock_data_client, positions, total_equity, cash_available, ticker, target_weight, is_sector=False):
+    # Enforce ETF and sector caps
+    if is_sector:
+        target_weight = min(target_weight, MAX_SECTOR_WEIGHT)
+    else:
+        target_weight = min(target_weight, MAX_ETF_WEIGHT)
+
     target_value = total_equity * target_weight
     current_value = float(positions[ticker].market_value) if ticker in positions else 0.0
     if target_value <= 0:
@@ -585,10 +642,10 @@ def rebalance_to_target(trading_client, stock_data_client, positions, total_equi
     if price <= 0 or cash_available < price:
         return
     qty = int((target_value - current_value) // price)
-    if qty > 0:
+    if qty > 0 and can_trade_today():
         assert_safe_order(ticker, AssetClass.US_EQUITY)
         order = MarketOrderRequest(symbol=ticker, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
-        trading_client.submit_order(order_data=order)
+        submit_order_safe(trading_client, order, label=f"BUY {ticker} toward {target_weight:.3f}")
         log.info(f"BUY {qty} {ticker} toward target weight {target_weight:.3f}")
 
 
@@ -601,12 +658,16 @@ def apply_trailing_stops(trading_client, positions):
         )
         for order in open_orders:
             if order.side == OrderSide.SELL:
-                trading_client.cancel_order_by_id(order.id)
-        order = TrailingStopOrderRequest(
-            symbol=symbol, qty=abs(float(pos.qty)), side=OrderSide.SELL,
-            time_in_force=TimeInForce.GTC, trail_percent=TRAILING_STOP_PCT,
-        )
-        trading_client.submit_order(order_data=order)
+                try:
+                    trading_client.cancel_order_by_id(order.id)
+                except Exception as e:
+                    log.warning(f"Failed to cancel order {order.id} for {symbol}: {e}")
+        if can_trade_today():
+            order = TrailingStopOrderRequest(
+                symbol=symbol, qty=abs(float(pos.qty)), side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC, trail_percent=TRAILING_STOP_PCT,
+            )
+            submit_order_safe(trading_client, order, label=f"Trailing stop {symbol}")
 
 
 def check_options_exposure(positions, total_equity):
@@ -647,6 +708,8 @@ def trading_bot_loop():
 
     while True:
         try:
+            reset_trade_counter_if_new_day()
+
             if time.gmtime().tm_wday >= 5:
                 time.sleep(WEEKEND_SLEEP_SECONDS)
                 continue
@@ -660,14 +723,16 @@ def trading_bot_loop():
             cash_available = float(account.cash)
             positions = {p.symbol: p for p in trading_client.get_all_positions()}
 
-            # --- Protective trailing stops on all held equities/ETFs ---
             apply_trailing_stops(trading_client, positions)
 
-            # --- 1. CORE SLEEVE: 70% fixed across long-term broad ETFs ---
+            # 1. CORE SLEEVE
             for ticker, weight in CORE_ETFS.items():
-                rebalance_to_target(trading_client, stock_data_client, positions, total_equity, cash_available, ticker, weight)
+                rebalance_to_target(
+                    trading_client, stock_data_client, positions,
+                    total_equity, cash_available, ticker, weight, is_sector=False
+                )
 
-            # --- 2. REGIME / RISK SCORE drives satellite vs hedge split ---
+            # 2. REGIME / RISK SPLIT
             risk_mgr = RiskManager(de)
             risk_score = risk_mgr.regime_risk_score()
             hedge_weight = float(np.clip(
@@ -677,7 +742,7 @@ def trading_bot_loop():
             satellite_weight = SATELLITE_HEDGE_TOTAL - hedge_weight
             log.info(f"Risk score={risk_score:.2f} -> satellite={satellite_weight:.2%}, hedge={hedge_weight:.2%}")
 
-            # --- 3. SATELLITE SLEEVE: composite-scored, mean-variance optimized ---
+            # 3. SATELLITE SLEEVE
             scores = composite_scores(de, fundamentals, sentiment, SECTOR_TICKERS)
             top_sectors = [t for t, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N_SECTORS]]
             if top_sectors:
@@ -686,18 +751,23 @@ def trading_bot_loop():
                 cov = de.covariance_matrix(top_sectors)
                 sat_weights = optimize_weights(expected_returns, cov, satellite_weight)
                 for ticker, weight in sat_weights.items():
-                    rebalance_to_target(trading_client, stock_data_client, positions, total_equity, cash_available, ticker, weight)
+                    rebalance_to_target(
+                        trading_client, stock_data_client, positions,
+                        total_equity, cash_available, ticker, weight, is_sector=True
+                    )
 
-            # --- 4. HEDGE SLEEVE: ETF hedges get (1 - PUT_HEDGE_SHARE) of hedge_weight;
-            #        the rest is reserved as a dollar budget for protective puts below ---
+            # 4. HEDGE SLEEVE
             etf_hedge_weight = hedge_weight * (1 - PUT_HEDGE_SHARE)
             put_budget = total_equity * hedge_weight * PUT_HEDGE_SHARE
             hedge_alloc = risk_mgr.hedge_weight_breakdown(etf_hedge_weight)
             for name, weight in hedge_alloc.items():
                 ticker = HEDGE_INSTRUMENTS[name]
-                rebalance_to_target(trading_client, stock_data_client, positions, total_equity, cash_available, ticker, weight)
+                rebalance_to_target(
+                    trading_client, stock_data_client, positions,
+                    total_equity, cash_available, ticker, weight, is_sector=False
+                )
 
-            # --- 5. OPTIONS OVERLAY: covered calls (income) + protective puts (hedge) ---
+            # 5. OPTIONS OVERLAY
             if OPTIONS_ENABLED and time.time() - last_options_run > OPTIONS_RUN_INTERVAL_SECONDS:
                 options_pct = check_options_exposure(positions, total_equity)
                 if options_pct < MAX_OPTIONS_PCT_OF_EQUITY:
@@ -709,7 +779,6 @@ def trading_bot_loop():
                         spot = None
 
                     if spot:
-                        # Covered calls: written against whatever core shares we actually hold
                         core_pos = positions.get(COVERED_CALL_UNDERLYING)
                         if core_pos:
                             shares_held = float(core_pos.qty)
@@ -717,7 +786,6 @@ def trading_bot_loop():
                             existing_short = abs(short_calls) if short_calls < 0 else 0.0
                             options_engine.sell_covered_calls(COVERED_CALL_UNDERLYING, shares_held, existing_short, spot)
 
-                        # Protective puts: sized to the core position, capped by dollar budget
                         put_pos = positions.get(PROTECTIVE_PUT_UNDERLYING)
                         shares_to_hedge = float(put_pos.qty) if put_pos else 0.0
                         long_puts = opt_summary.get((PROTECTIVE_PUT_UNDERLYING, "put"), 0.0)
@@ -727,7 +795,7 @@ def trading_bot_loop():
                         )
                 last_options_run = time.time()
 
-            # --- 6. FINAL OPTIONS EXPOSURE CHECK ---
+            # 6. FINAL OPTIONS EXPOSURE CHECK
             check_options_exposure(positions, total_equity)
 
         except Exception as e:
@@ -739,5 +807,4 @@ def trading_bot_loop():
 threading.Thread(target=trading_bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    # Render assigns the port dynamically via $PORT — don't hardcode it.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
