@@ -1,3 +1,4 @@
+"""
 Global Multi-Factor Risk Engine (Equities, ETFs, and Listed Options ONLY)
 --------------------------------------------------------------------------
 Core (70%)      : Broad, long-term, low-cost ETFs (VOO / VXUS / BND)
@@ -667,4 +668,5 @@ def trading_bot_loop():
 threading.Thread(target=trading_bot_loop, daemon=True).start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    # Render assigns the port dynamically via $PORT — don't hardcode it.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
