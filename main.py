@@ -54,6 +54,7 @@ HISTORY_YEARS = 12
 RISK_FREE_ANNUAL = 0.04
 TRADING_DAYS = 252
 
+# Core 70% sleeve — ONLY ETFs, stocks never touch this
 CORE_ETFS = {
     "VOO": 0.45,
     "VXUS": 0.15,
@@ -76,7 +77,7 @@ SECTOR_UNIVERSE = {
     "Emerging_Markets": "VWO",
 }
 SECTOR_TICKERS = list(SECTOR_UNIVERSE.values())
-TOP_N_SECTORS = 3
+TOP_N_SATELLITE = 3
 
 HEDGE_INSTRUMENTS = {
     "long_duration_bonds": "TLT",
@@ -92,8 +93,6 @@ MAX_HEDGE_WEIGHT = 0.07   # hedge < 7% of portfolio
 
 # --- Options overlay config ---
 OPTIONS_ENABLED = True
-COVERED_CALL_UNDERLYING = "VOO"
-PROTECTIVE_PUT_UNDERLYING = "VOO"
 CALL_OTM_PCT = 0.03
 PUT_OTM_PCT = 0.07
 OPTIONS_MIN_DTE = 25
@@ -102,7 +101,6 @@ PUT_HEDGE_SHARE = 0.25
 OPTIONS_RUN_INTERVAL_SECONDS = 24 * 3600
 MAX_OPTIONS_PCT_OF_EQUITY = 2.0   # options <= 2% of equity
 
-# Only these asset classes may ever receive an order from this bot.
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
 
 TRAILING_STOP_PCT = 5.0
@@ -112,7 +110,7 @@ WEEKEND_SLEEP_SECONDS = 1800
 
 # Position caps
 MAX_ETF_WEIGHT = 0.40       # no single ETF > 40%
-MAX_SECTOR_WEIGHT = 0.15    # no single sector > 15%
+MAX_SATELLITE_WEIGHT = 0.15 # no single sector/stock > 15%
 
 # Option liquidity filters
 MIN_OPTION_VOLUME = 500
@@ -125,7 +123,7 @@ LAST_TRADE_DAY = None
 
 
 # ============================================================
-# SAFETY GUARD — never trade currency/forex or anything off-universe
+# SAFETY GUARD
 # ============================================================
 
 def assert_safe_order(symbol: str, asset_class):
@@ -165,6 +163,42 @@ def submit_order_safe(trading_client: TradingClient, order_data, label: str = ""
 
 
 # ============================================================
+# NYSE/NASDAQ STOCK UNIVERSE
+# ============================================================
+
+def get_nyse_nasdaq_universe(trading_client: TradingClient):
+    assets = trading_client.get_all_assets()
+    tickers = [
+        a.symbol
+        for a in assets
+        if a.asset_class == AssetClass.US_EQUITY
+        and a.status == AssetStatus.ACTIVE
+        and a.tradable
+        and a.exchange in ("NYSE", "NASDAQ")
+    ]
+    log.info(f"Raw NYSE/NASDAQ universe size: {len(tickers)}")
+    return tickers
+
+
+def filter_liquid_stocks(tickers, min_volume=500000, min_market_cap=2e9):
+    liquid = []
+    for t in tickers:
+        try:
+            info = yf.Ticker(t).info
+            if (
+                info.get("averageVolume", 0) >= min_volume
+                and info.get("marketCap", 0) >= min_market_cap
+                and info.get("regularMarketPrice", 0) >= 5
+            ):
+                liquid.append(t)
+        except Exception as e:
+            log.warning(f"Liquidity filter failed for {t}: {e}")
+            continue
+    log.info(f"Filtered liquid NYSE/NASDAQ stocks: {len(liquid)}")
+    return liquid
+
+
+# ============================================================
 # BLACK–SCHOLES PRICER
 # ============================================================
 
@@ -184,7 +218,7 @@ def black_scholes_price(
 
 
 # ============================================================
-# 1. DATA ENGINE
+# DATA ENGINE
 # ============================================================
 
 class DataEngine:
@@ -258,7 +292,7 @@ def get_underlying_vol(data_engine: DataEngine, underlying: str, default_sigma: 
 
 
 # ============================================================
-# 2. FUNDAMENTAL ANALYZER
+# FUNDAMENTAL ANALYZER
 # ============================================================
 
 class FundamentalAnalyzer:
@@ -296,7 +330,7 @@ class FundamentalAnalyzer:
 
 
 # ============================================================
-# 3. NEWS SENTIMENT
+# NEWS SENTIMENT
 # ============================================================
 
 class NewsSentimentAnalyzer:
@@ -321,7 +355,7 @@ class NewsSentimentAnalyzer:
 
 
 # ============================================================
-# 4. COMPOSITE SCORER
+# COMPOSITE SCORER
 # ============================================================
 
 def zscore(d: dict) -> dict:
@@ -354,7 +388,7 @@ def composite_scores(data_engine, fundamentals, sentiment, tickers, weights=None
 
 
 # ============================================================
-# 5. MEAN-VARIANCE OPTIMIZER
+# MEAN-VARIANCE OPTIMIZER
 # ============================================================
 
 def optimize_weights(expected_returns, cov_matrix, total_weight, max_weight_per_asset=0.6):
@@ -386,7 +420,7 @@ def optimize_weights(expected_returns, cov_matrix, total_weight, max_weight_per_
 
 
 # ============================================================
-# 6. REGIME / RISK MANAGER
+# REGIME / RISK MANAGER
 # ============================================================
 
 class RiskManager:
@@ -422,7 +456,7 @@ class RiskManager:
 
 
 # ============================================================
-# 7. OPTIONS ENGINE
+# OPTIONS ENGINE
 # ============================================================
 
 OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
@@ -489,12 +523,10 @@ class OptionsEngine:
             return None, None
 
     def _option_liquidity_ok(self, contract, bid, ask):
-        # Volume filter
         vol = getattr(contract, "volume", None)
         if vol is None or vol < MIN_OPTION_VOLUME:
             log.info(f"Skipping illiquid option {contract.symbol}: volume={vol}")
             return False
-        # Spread filter
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             return False
         mid = (bid + ask) / 2.0
@@ -611,7 +643,7 @@ class OptionsEngine:
 
 
 # ============================================================
-# 8. EXECUTION LAYER
+# EXECUTION LAYER
 # ============================================================
 
 def get_price(stock_data_client, ticker):
@@ -620,12 +652,20 @@ def get_price(stock_data_client, ticker):
     return float(trade.price)
 
 
-def rebalance_to_target(trading_client, stock_data_client, positions, total_equity, cash_available, ticker, target_weight, is_sector=False):
-    # Enforce ETF and sector caps
-    if is_sector:
-        target_weight = min(target_weight, MAX_SECTOR_WEIGHT)
-    else:
+def rebalance_to_target(
+    trading_client,
+    stock_data_client,
+    positions,
+    total_equity,
+    cash_available,
+    ticker,
+    target_weight,
+    is_core=False,
+):
+    if is_core:
         target_weight = min(target_weight, MAX_ETF_WEIGHT)
+    else:
+        target_weight = min(target_weight, MAX_SATELLITE_WEIGHT)
 
     target_value = total_equity * target_weight
     current_value = float(positions[ticker].market_value) if ticker in positions else 0.0
@@ -681,7 +721,7 @@ def check_options_exposure(positions, total_equity):
 
 
 # ============================================================
-# 9. MAIN LOOP
+# MAIN LOOP
 # ============================================================
 
 def trading_bot_loop():
@@ -696,12 +736,23 @@ def trading_bot_loop():
     stock_data_client = StockHistoricalDataClient(api_key, secret_key)
     option_data_client = OptionHistoricalDataClient(api_key, secret_key)
 
-    all_tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + list(HEDGE_INSTRUMENTS.values())
+    raw_stock_universe = get_nyse_nasdaq_universe(trading_client)
+    stock_universe = filter_liquid_stocks(raw_stock_universe)
+
+    all_tickers = (
+        list(CORE_ETFS.keys())
+        + SECTOR_TICKERS
+        + list(HEDGE_INSTRUMENTS.values())
+        + stock_universe
+    )
+
     fundamentals = FundamentalAnalyzer()
     sentiment = NewsSentimentAnalyzer()
     de = DataEngine(all_tickers)
 
     options_engine = OptionsEngine(trading_client, option_data_client, de)
+
+    OPTION_UNIVERSE = list(CORE_ETFS.keys()) + stock_universe
 
     last_data_refresh = 0
     last_options_run = 0
@@ -725,11 +776,11 @@ def trading_bot_loop():
 
             apply_trailing_stops(trading_client, positions)
 
-            # 1. CORE SLEEVE
+            # 1. CORE SLEEVE — ONLY ETFs
             for ticker, weight in CORE_ETFS.items():
                 rebalance_to_target(
                     trading_client, stock_data_client, positions,
-                    total_equity, cash_available, ticker, weight, is_sector=False
+                    total_equity, cash_available, ticker, weight, is_core=True
                 )
 
             # 2. REGIME / RISK SPLIT
@@ -742,18 +793,19 @@ def trading_bot_loop():
             satellite_weight = SATELLITE_HEDGE_TOTAL - hedge_weight
             log.info(f"Risk score={risk_score:.2f} -> satellite={satellite_weight:.2%}, hedge={hedge_weight:.2%}")
 
-            # 3. SATELLITE SLEEVE
-            scores = composite_scores(de, fundamentals, sentiment, SECTOR_TICKERS)
-            top_sectors = [t for t, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N_SECTORS]]
-            if top_sectors:
+            # 3. SATELLITE SLEEVE — sectors + NYSE/NASDAQ stocks, never touching core
+            satellite_candidates = SECTOR_TICKERS + stock_universe
+            scores = composite_scores(de, fundamentals, sentiment, satellite_candidates)
+            top_assets = [t for t, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N_SATELLITE]]
+            if top_assets:
                 momentum = de.momentum_12_1()
-                expected_returns = {t: momentum.get(t, 0.0) for t in top_sectors}
-                cov = de.covariance_matrix(top_sectors)
+                expected_returns = {t: momentum.get(t, 0.0) for t in top_assets}
+                cov = de.covariance_matrix(top_assets)
                 sat_weights = optimize_weights(expected_returns, cov, satellite_weight)
                 for ticker, weight in sat_weights.items():
                     rebalance_to_target(
                         trading_client, stock_data_client, positions,
-                        total_equity, cash_available, ticker, weight, is_sector=True
+                        total_equity, cash_available, ticker, weight, is_core=False
                     )
 
             # 4. HEDGE SLEEVE
@@ -764,34 +816,40 @@ def trading_bot_loop():
                 ticker = HEDGE_INSTRUMENTS[name]
                 rebalance_to_target(
                     trading_client, stock_data_client, positions,
-                    total_equity, cash_available, ticker, weight, is_sector=False
+                    total_equity, cash_available, ticker, weight, is_core=False
                 )
 
-            # 5. OPTIONS OVERLAY
+            # 5. OPTIONS OVERLAY — ETFs + NYSE/NASDAQ stocks you actually hold
             if OPTIONS_ENABLED and time.time() - last_options_run > OPTIONS_RUN_INTERVAL_SECONDS:
                 options_pct = check_options_exposure(positions, total_equity)
                 if options_pct < MAX_OPTIONS_PCT_OF_EQUITY:
                     opt_summary = options_position_summary(list(positions.values()))
-                    try:
-                        spot = get_price(stock_data_client, COVERED_CALL_UNDERLYING)
-                    except Exception as e:
-                        log.warning(f"Spot price fetch failed for options overlay: {e}")
-                        spot = None
 
-                    if spot:
-                        core_pos = positions.get(COVERED_CALL_UNDERLYING)
-                        if core_pos:
-                            shares_held = float(core_pos.qty)
-                            short_calls = opt_summary.get((COVERED_CALL_UNDERLYING, "call"), 0.0)
-                            existing_short = abs(short_calls) if short_calls < 0 else 0.0
-                            options_engine.sell_covered_calls(COVERED_CALL_UNDERLYING, shares_held, existing_short, spot)
+                    per_underlying_budget = put_budget / max(len(OPTION_UNIVERSE), 1)
 
-                        put_pos = positions.get(PROTECTIVE_PUT_UNDERLYING)
-                        shares_to_hedge = float(put_pos.qty) if put_pos else 0.0
-                        long_puts = opt_summary.get((PROTECTIVE_PUT_UNDERLYING, "put"), 0.0)
+                    for underlying in OPTION_UNIVERSE:
+                        try:
+                            spot = get_price(stock_data_client, underlying)
+                        except Exception as e:
+                            log.warning(f"Spot price fetch failed for {underlying} options overlay: {e}")
+                            continue
+
+                        if not spot:
+                            continue
+
+                        pos = positions.get(underlying)
+                        shares_held = float(pos.qty) if pos else 0.0
+                        if shares_held <= 0:
+                            continue
+
+                        short_calls = opt_summary.get((underlying, "call"), 0.0)
+                        existing_short = abs(short_calls) if short_calls < 0 else 0.0
+                        options_engine.sell_covered_calls(underlying, shares_held, existing_short, spot)
+
+                        long_puts = opt_summary.get((underlying, "put"), 0.0)
                         existing_long = long_puts if long_puts > 0 else 0.0
                         options_engine.buy_protective_puts(
-                            PROTECTIVE_PUT_UNDERLYING, shares_to_hedge, existing_long, spot, put_budget
+                            underlying, shares_held, existing_long, spot, per_underlying_budget
                         )
                 last_options_run = time.time()
 
