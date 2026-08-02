@@ -1,0 +1,7 @@
+flask
+alpaca-trade-api
+gunicorn
+yfinance
+pandas
+numpy
+scipy
