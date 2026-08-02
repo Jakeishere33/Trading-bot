@@ -1,37 +1,17 @@
-"""
-Global Multi-Factor Risk Engine (Equities, ETFs, and Listed Options ONLY)
---------------------------------------------------------------------------
-Core (70%)      : Broad, long-term, low-cost ETFs (VOO / VXUS / BND)
-Satellite (var.): Statistically + fundamentally + sentiment-screened sector ETFs,
-                   weighted by a mean-variance (Markowitz) optimizer
-Hedge (var.)     : Multiple simultaneous hedges — long bonds, gold, inverse equity,
-                   AND protective puts on the core position — weighted by which
-                   macro risk factor is currently elevated
-Options overlay  : Covered calls on the core equity ETF for income, protective
-                   puts on the core equity ETF for extra tail-risk hedging.
-
-This bot intentionally NEVER trades currency/forex pairs or crypto. Only US
-equities, ETFs, and their listed options are eligible for orders — enforced by
-SAFE_ASSET_CLASSES below and checked before every submission.
-
-DISCLAIMER: This is a framework, not a proven strategy. Every threshold, lookback,
-and weight below is a starting point for you to backtest and tune. Options trading
-involves substantial risk, including assignment risk on covered calls and premium
-loss on protective puts. Run this on paper trading and validate extensively before
-ever pointing it at a live account.
-"""
-
+```python
 import os
 import re
 import time
 import threading
 import logging
 from datetime import date, timedelta, datetime
+from math import log, sqrt, exp
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy.optimize import minimize
+from scipy.stats import norm
 from flask import Flask
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
@@ -43,7 +23,15 @@ from alpaca.trading.requests import (
     GetOptionContractsRequest,
     GetOrdersRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, ContractType, AssetStatus, AssetClass, QueryOrderStatus
+from alpaca.trading.enums import (
+    OrderSide,
+    TimeInForce,
+    OrderType,
+    ContractType,
+    AssetStatus,
+    AssetClass,
+    QueryOrderStatus,
+)
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
@@ -54,7 +42,7 @@ log = logging.getLogger("risk_engine")
 app = Flask(__name__)
 
 
-@app.route('/')
+@app.route("/")
 def home():
     return "Global Multi-Factor Risk Engine Online (Equities/ETFs/Options only)!", 200
 
@@ -136,6 +124,35 @@ def assert_safe_order(symbol: str, asset_class):
 
 
 # ============================================================
+# BLACK–SCHOLES PRICER
+# ============================================================
+
+def black_scholes_price(
+    S: float, K: float, T: float, r: float, sigma: float, option_type: str
+) -> float:
+    """
+    Black–Scholes price for European calls/puts.
+
+    S: spot price
+    K: strike
+    T: time to expiration in years
+    r: risk-free rate (annual)
+    sigma: volatility (annual)
+    option_type: 'call' or 'put'
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+
+    d1 = (log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
+
+    if option_type == "call":
+        return S * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+
+# ============================================================
 # 1. DATA ENGINE — 12-year history, returns, Sharpe, momentum, vol
 # ============================================================
 
@@ -202,6 +219,11 @@ class DataEngine:
     def covariance_matrix(self, tickers, lookback_days=756):
         sub = self.returns[tickers].dropna().tail(lookback_days)
         return sub.cov() * TRADING_DAYS
+
+
+def get_underlying_vol(data_engine: DataEngine, underlying: str, default_sigma: float = 0.20) -> float:
+    vol = data_engine.volatility().get(underlying)
+    return vol if vol and vol > 0 else default_sigma
 
 
 # ============================================================
@@ -374,7 +396,7 @@ class RiskManager:
 # 7. OPTIONS ENGINE — covered calls (income) + protective puts (hedge)
 # ============================================================
 
-OCC_SYMBOL_RE = re.compile(r'^([A-Z]{1,6})(\d{6})([CP])(\d{8})$')
+OCC_SYMBOL_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
 
 
 def parse_occ_symbol(symbol):
@@ -403,9 +425,15 @@ def options_position_summary(positions):
 
 
 class OptionsEngine:
-    def __init__(self, trading_client: TradingClient, option_data_client: OptionHistoricalDataClient):
+    def __init__(
+        self,
+        trading_client: TradingClient,
+        option_data_client: OptionHistoricalDataClient,
+        data_engine: DataEngine,
+    ):
         self.trading = trading_client
         self.data = option_data_client
+        self.de = data_engine
 
     def _find_contracts(self, underlying, contract_type, min_dte=OPTIONS_MIN_DTE, max_dte=OPTIONS_MAX_DTE):
         today = date.today()
@@ -452,15 +480,36 @@ class OptionsEngine:
         if not contract:
             return
         assert_safe_order(contract.symbol, AssetClass.US_OPTION)
+
+        T = (contract.expiration_date - date.today()).days / TRADING_DAYS
+        sigma = get_underlying_vol(self.de, underlying)
+        bs_price = black_scholes_price(
+            S=spot_price,
+            K=float(contract.strike_price),
+            T=T,
+            r=RISK_FREE_ANNUAL,
+            sigma=sigma,
+            option_type="call",
+        )
+
         bid, _ = self._quote(contract.symbol)
-        if not bid or bid <= 0:
+        use_price = bid if bid and bid > 0 else bs_price
+        if use_price <= 0:
             return
+
         order = LimitOrderRequest(
-            symbol=contract.symbol, qty=to_sell, side=OrderSide.SELL,
-            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=round(bid, 2),
+            symbol=contract.symbol,
+            qty=to_sell,
+            side=OrderSide.SELL,
+            type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(use_price, 2),
         )
         self.trading.submit_order(order_data=order)
-        log.info(f"SELL {to_sell} covered call(s) {contract.symbol} @ {bid} (income sleeve)")
+        log.info(
+            f"SELL {to_sell} covered call(s) {contract.symbol} @ {use_price:.2f} "
+            f"(BS={bs_price:.2f}, income sleeve)"
+        )
 
     def buy_protective_puts(self, underlying, shares_to_hedge, existing_long_put_qty, spot_price, dollar_budget):
         """Hedge sleeve: buys OTM puts sized to the underlying position, capped by
@@ -474,19 +523,41 @@ class OptionsEngine:
         if not contract:
             return
         assert_safe_order(contract.symbol, AssetClass.US_OPTION)
+
+        T = (contract.expiration_date - date.today()).days / TRADING_DAYS
+        sigma = get_underlying_vol(self.de, underlying)
+        bs_price = black_scholes_price(
+            S=spot_price,
+            K=float(contract.strike_price),
+            T=T,
+            r=RISK_FREE_ANNUAL,
+            sigma=sigma,
+            option_type="put",
+        )
+
         _, ask = self._quote(contract.symbol)
-        if not ask or ask <= 0:
+        use_price = ask if ask and ask > 0 else bs_price
+        if use_price <= 0:
             return
-        affordable = int(dollar_budget // (ask * 100))
+
+        affordable = int(dollar_budget // (use_price * 100))
         qty = max(0, min(to_buy, affordable))
         if qty <= 0:
             return
+
         order = LimitOrderRequest(
-            symbol=contract.symbol, qty=qty, side=OrderSide.BUY,
-            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=round(ask, 2),
+            symbol=contract.symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(use_price, 2),
         )
         self.trading.submit_order(order_data=order)
-        log.info(f"BUY {qty} protective put(s) {contract.symbol} @ {ask} (hedge sleeve)")
+        log.info(
+            f"BUY {qty} protective put(s) {contract.symbol} @ {use_price:.2f} "
+            f"(BS={bs_price:.2f}, hedge sleeve)"
+        )
 
 
 # ============================================================
@@ -564,12 +635,13 @@ def trading_bot_loop():
     trading_client = TradingClient(api_key, secret_key, paper=True)
     stock_data_client = StockHistoricalDataClient(api_key, secret_key)
     option_data_client = OptionHistoricalDataClient(api_key, secret_key)
-    options_engine = OptionsEngine(trading_client, option_data_client)
 
     all_tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + list(HEDGE_INSTRUMENTS.values())
     fundamentals = FundamentalAnalyzer()
     sentiment = NewsSentimentAnalyzer()
     de = DataEngine(all_tickers)
+
+    options_engine = OptionsEngine(trading_client, option_data_client, de)
 
     last_data_refresh = 0
     last_options_run = 0
@@ -670,3 +742,4 @@ threading.Thread(target=trading_bot_loop, daemon=True).start()
 if __name__ == "__main__":
     # Render assigns the port dynamically via $PORT — don't hardcode it.
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+```
