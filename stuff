@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: multi-factor-risk-engine
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m gunicorn trading_bot:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ALPACA_PAPER_KEY
+        sync: false
+      - key: ALPACA_PAPER_SECRET
+        sync: false
