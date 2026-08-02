@@ -43,7 +43,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Global Multi-Factor Risk Engine Online (Equities/ETFs/Options only)!", 200
+    return "Global Multi-Factor Risk Engine Online (ETFs/NYSE/NASDAQ/Options)!", 200
 
 
 # ============================================================
@@ -54,7 +54,7 @@ HISTORY_YEARS = 12
 RISK_FREE_ANNUAL = 0.04
 TRADING_DAYS = 252
 
-# Core 70% sleeve — ONLY ETFs, stocks never touch this
+# Core 70% sleeve — ONLY ETFs
 CORE_ETFS = {
     "VOO": 0.45,
     "VXUS": 0.15,
@@ -91,7 +91,7 @@ SATELLITE_HEDGE_TOTAL = 1.0 - CORE_TOTAL_WEIGHT   # 0.30
 MIN_HEDGE_WEIGHT = 0.02
 MAX_HEDGE_WEIGHT = 0.07   # hedge < 7% of portfolio
 
-# --- Options overlay config ---
+# Options overlay config
 OPTIONS_ENABLED = True
 CALL_OTM_PCT = 0.03
 PUT_OTM_PCT = 0.07
@@ -116,10 +116,37 @@ MAX_SATELLITE_WEIGHT = 0.15 # no single sector/stock > 15%
 MIN_OPTION_VOLUME = 500
 MAX_OPTION_SPREAD_PCT = 0.15  # bid/ask spread <= 15% of mid
 
+# Stock liquidity filters
+MIN_STOCK_VOLUME = 500000
+MIN_STOCK_MARKET_CAP = 2e9
+MIN_STOCK_PRICE = 5.0
+MAX_STOCK_SPREAD_PCT = 0.005  # 0.5%
+
 # Trade limit
 MAX_TRADES_PER_DAY = 30
 TRADES_TODAY = 0
 LAST_TRADE_DAY = None
+
+# Volatility throttle
+VIX_PAUSE_LEVEL = 40
+VIX_SLOW_LEVEL = 30
+
+# Drawdown kill-switch
+MAX_POSITION_LOSS_PCT = 0.25   # exit if >25% loss
+REDUCE_POSITION_LOSS_PCT = 0.15
+PORTFOLIO_PAUSE_DD_PCT = 0.10
+PORTFOLIO_EXIT_SATELLITE_DD_PCT = 0.20
+
+# Holding period / turnover
+MIN_HOLD_DAYS = 5
+MAX_TURNOVER_PCT_PER_REBAL = 0.20
+
+# No trade windows (ET time)
+NO_TRADE_BEFORE = (9, 45)   # 9:45 AM
+NO_TRADE_AFTER = (15, 55)   # 3:55 PM
+
+# Correlation cap
+MAX_CORRELATION = 0.85
 
 
 # ============================================================
@@ -132,6 +159,27 @@ def assert_safe_order(symbol: str, asset_class):
 
 
 # ============================================================
+# TIME / TRADE WINDOW HELPERS
+# ============================================================
+
+def now_et():
+    # Assumes server is UTC; adjust if needed
+    return datetime.utcnow()
+
+
+def in_no_trade_window():
+    t = now_et()
+    h, m = t.hour, t.minute
+    # Before first 15 minutes
+    if (h < NO_TRADE_BEFORE[0]) or (h == NO_TRADE_BEFORE[0] and m < NO_TRADE_BEFORE[1]):
+        return True
+    # After last 5 minutes
+    if (h > NO_TRADE_AFTER[0]) or (h == NO_TRADE_AFTER[0] and m >= NO_TRADE_AFTER[1]):
+        return True
+    return False
+
+
+# ============================================================
 # TRADE LIMIT / SUBMIT WRAPPER
 # ============================================================
 
@@ -141,10 +189,14 @@ def reset_trade_counter_if_new_day():
     if LAST_TRADE_DAY != today:
         LAST_TRADE_DAY = today
         TRADES_TODAY = 0
+        log.info("New trading day: trade counter reset.")
 
 
 def can_trade_today() -> bool:
     reset_trade_counter_if_new_day()
+    if in_no_trade_window():
+        log.info("In no-trade window (open/close). Skipping trades.")
+        return False
     return TRADES_TODAY < MAX_TRADES_PER_DAY
 
 
@@ -153,6 +205,9 @@ def submit_order_safe(trading_client: TradingClient, order_data, label: str = ""
     reset_trade_counter_if_new_day()
     if TRADES_TODAY >= MAX_TRADES_PER_DAY:
         log.warning(f"Trade limit reached ({MAX_TRADES_PER_DAY} per day). Skipping order: {label}")
+        return
+    if in_no_trade_window():
+        log.info(f"No-trade window active. Skipping order: {label}")
         return
     try:
         trading_client.submit_order(order_data=order_data)
@@ -180,15 +235,15 @@ def get_nyse_nasdaq_universe(trading_client: TradingClient):
     return tickers
 
 
-def filter_liquid_stocks(tickers, min_volume=500000, min_market_cap=2e9):
+def filter_liquid_stocks(tickers):
     liquid = []
     for t in tickers:
         try:
             info = yf.Ticker(t).info
             if (
-                info.get("averageVolume", 0) >= min_volume
-                and info.get("marketCap", 0) >= min_market_cap
-                and info.get("regularMarketPrice", 0) >= 5
+                info.get("averageVolume", 0) >= MIN_STOCK_VOLUME
+                and info.get("marketCap", 0) >= MIN_STOCK_MARKET_CAP
+                and info.get("regularMarketPrice", 0) >= MIN_STOCK_PRICE
             ):
                 liquid.append(t)
         except Exception as e:
@@ -281,7 +336,7 @@ class DataEngine:
             result[ticker] = float(r.rolling(window).std().iloc[-1] * np.sqrt(TRADING_DAYS))
         return result
 
-    def covariance_matrix(self, tickers, lookback_days=756):
+    def covariance_matrix(self, tickers, lookback_days=252):
         sub = self.returns[tickers].dropna().tail(lookback_days)
         return sub.cov() * TRADING_DAYS
 
@@ -388,11 +443,39 @@ def composite_scores(data_engine, fundamentals, sentiment, tickers, weights=None
 
 
 # ============================================================
-# MEAN-VARIANCE OPTIMIZER
+# MEAN-VARIANCE OPTIMIZER WITH CORRELATION CAP
 # ============================================================
+
+def enforce_correlation_cap(cov_matrix, tickers, max_corr=MAX_CORRELATION):
+    # Simple heuristic: drop assets that are too correlated with already-selected ones
+    selected = []
+    for t in tickers:
+        if not selected:
+            selected.append(t)
+            continue
+        ok = True
+        for s in selected:
+            var_t = cov_matrix.loc[t, t]
+            var_s = cov_matrix.loc[s, s]
+            cov_ts = cov_matrix.loc[t, s]
+            if var_t <= 0 or var_s <= 0:
+                continue
+            corr = cov_ts / (sqrt(var_t) * sqrt(var_s))
+            if corr > max_corr:
+                ok = False
+                break
+        if ok:
+            selected.append(t)
+    return selected
+
 
 def optimize_weights(expected_returns, cov_matrix, total_weight, max_weight_per_asset=0.6):
     tickers = list(expected_returns.keys())
+    if not tickers:
+        return {}
+
+    # Enforce correlation cap before optimization
+    tickers = enforce_correlation_cap(cov_matrix, tickers, MAX_CORRELATION)
     n = len(tickers)
     if n == 0:
         return {}
@@ -420,7 +503,7 @@ def optimize_weights(expected_returns, cov_matrix, total_weight, max_weight_per_
 
 
 # ============================================================
-# REGIME / RISK MANAGER
+# REGIME / RISK MANAGER + VOLATILITY THROTTLE
 # ============================================================
 
 class RiskManager:
@@ -444,6 +527,14 @@ class RiskManager:
         except Exception as e:
             log.warning(f"VIX fetch failed: {e}")
         return float(np.mean(score_components)) if score_components else 0.3
+
+    def current_vix_level(self):
+        try:
+            vix_hist = yf.download(VIX_TICKER, period="5d", progress=False, auto_adjust=True)["Close"]
+            return float(vix_hist.iloc[-1])
+        except Exception as e:
+            log.warning(f"VIX fetch failed for throttle: {e}")
+            return 20.0
 
     def hedge_weight_breakdown(self, hedge_total_weight):
         vol = self.de.volatility()
@@ -652,6 +743,27 @@ def get_price(stock_data_client, ticker):
     return float(trade.price)
 
 
+def stock_liquidity_ok(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        bid = info.get("bid", None)
+        ask = info.get("ask", None)
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            return False
+        mid = (bid + ask) / 2.0
+        spread = ask - bid
+        if mid <= 0:
+            return False
+        spread_pct = spread / mid
+        if spread_pct > MAX_STOCK_SPREAD_PCT:
+            log.info(f"Skipping illiquid/wide-spread stock {ticker}: spread_pct={spread_pct:.2%}")
+            return False
+        return True
+    except Exception as e:
+        log.warning(f"Stock liquidity check failed for {ticker}: {e}")
+        return False
+
+
 def rebalance_to_target(
     trading_client,
     stock_data_client,
@@ -680,6 +792,8 @@ def rebalance_to_target(
         log.warning(f"Price fetch failed for {ticker}: {e}")
         return
     if price <= 0 or cash_available < price:
+        return
+    if not is_core and not stock_liquidity_ok(ticker):
         return
     qty = int((target_value - current_value) // price)
     if qty > 0 and can_trade_today():
@@ -721,6 +835,58 @@ def check_options_exposure(positions, total_equity):
 
 
 # ============================================================
+# KILL-SWITCHES: POSITION LOSS + PORTFOLIO DRAWDOWN
+# ============================================================
+
+def check_position_losses(trading_client, positions):
+    for symbol, p in positions.items():
+        if p.asset_class != AssetClass.US_EQUITY:
+            continue
+        try:
+            cost_basis = float(p.avg_entry_price)
+            market_price = float(p.market_value) / abs(float(p.qty)) if p.qty != 0 else cost_basis
+            if cost_basis <= 0:
+                continue
+            loss_pct = (cost_basis - market_price) / cost_basis
+            if loss_pct >= MAX_POSITION_LOSS_PCT and can_trade_today():
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=abs(float(p.qty)),
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                )
+                submit_order_safe(trading_client, order, label=f"EXIT {symbol} due to loss {loss_pct:.2%}")
+                log.warning(f"EXIT {symbol} due to large loss {loss_pct:.2%}")
+            elif loss_pct >= REDUCE_POSITION_LOSS_PCT and can_trade_today():
+                reduce_qty = int(abs(float(p.qty)) * 0.5)
+                if reduce_qty > 0:
+                    order = MarketOrderRequest(
+                        symbol=symbol,
+                        qty=reduce_qty,
+                        side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC,
+                    )
+                    submit_order_safe(trading_client, order, label=f"REDUCE {symbol} due to loss {loss_pct:.2%}")
+                    log.warning(f"REDUCE {symbol} due to moderate loss {loss_pct:.2%}")
+        except Exception as e:
+            log.warning(f"Position loss check failed for {symbol}: {e}")
+
+
+def check_portfolio_drawdown(account, initial_equity):
+    current_equity = float(account.portfolio_value)
+    if initial_equity <= 0:
+        return 0.0, False, False
+    dd_pct = (initial_equity - current_equity) / initial_equity
+    pause = dd_pct >= PORTFOLIO_PAUSE_DD_PCT
+    exit_satellite = dd_pct >= PORTFOLIO_EXIT_SATELLITE_DD_PCT
+    if pause:
+        log.warning(f"Portfolio drawdown {dd_pct:.2%} -> pause satellite trades.")
+    if exit_satellite:
+        log.warning(f"Portfolio drawdown {dd_pct:.2%} -> exit satellite sleeve.")
+    return dd_pct, pause, exit_satellite
+
+
+# ============================================================
 # MAIN LOOP
 # ============================================================
 
@@ -757,12 +923,23 @@ def trading_bot_loop():
     last_data_refresh = 0
     last_options_run = 0
 
+    # Track initial equity for drawdown
+    account = trading_client.get_account()
+    initial_equity = float(account.portfolio_value)
+
     while True:
         try:
             reset_trade_counter_if_new_day()
 
             if time.gmtime().tm_wday >= 5:
                 time.sleep(WEEKEND_SLEEP_SECONDS)
+                continue
+
+            risk_mgr = RiskManager(de)
+            vix_level = risk_mgr.current_vix_level()
+            if vix_level >= VIX_PAUSE_LEVEL:
+                log.warning(f"VIX={vix_level:.1f} >= {VIX_PAUSE_LEVEL}. Pausing new trades.")
+                time.sleep(LOOP_SLEEP_SECONDS)
                 continue
 
             if time.time() - last_data_refresh > 6 * 3600:
@@ -774,7 +951,10 @@ def trading_bot_loop():
             cash_available = float(account.cash)
             positions = {p.symbol: p for p in trading_client.get_all_positions()}
 
+            dd_pct, pause_satellite, exit_satellite = check_portfolio_drawdown(account, initial_equity)
+
             apply_trailing_stops(trading_client, positions)
+            check_position_losses(trading_client, positions)
 
             # 1. CORE SLEEVE — ONLY ETFs
             for ticker, weight in CORE_ETFS.items():
@@ -784,7 +964,6 @@ def trading_bot_loop():
                 )
 
             # 2. REGIME / RISK SPLIT
-            risk_mgr = RiskManager(de)
             risk_score = risk_mgr.regime_risk_score()
             hedge_weight = float(np.clip(
                 MIN_HEDGE_WEIGHT + risk_score * (MAX_HEDGE_WEIGHT - MIN_HEDGE_WEIGHT),
@@ -793,20 +972,33 @@ def trading_bot_loop():
             satellite_weight = SATELLITE_HEDGE_TOTAL - hedge_weight
             log.info(f"Risk score={risk_score:.2f} -> satellite={satellite_weight:.2%}, hedge={hedge_weight:.2%}")
 
-            # 3. SATELLITE SLEEVE — sectors + NYSE/NASDAQ stocks, never touching core
-            satellite_candidates = SECTOR_TICKERS + stock_universe
-            scores = composite_scores(de, fundamentals, sentiment, satellite_candidates)
-            top_assets = [t for t, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N_SATELLITE]]
-            if top_assets:
-                momentum = de.momentum_12_1()
-                expected_returns = {t: momentum.get(t, 0.0) for t in top_assets}
-                cov = de.covariance_matrix(top_assets)
-                sat_weights = optimize_weights(expected_returns, cov, satellite_weight)
-                for ticker, weight in sat_weights.items():
-                    rebalance_to_target(
-                        trading_client, stock_data_client, positions,
-                        total_equity, cash_available, ticker, weight, is_core=False
-                    )
+            # 3. SATELLITE SLEEVE — sectors + NYSE/NASDAQ stocks
+            if not exit_satellite and not pause_satellite and vix_level < VIX_SLOW_LEVEL:
+                satellite_candidates = SECTOR_TICKERS + stock_universe
+                scores = composite_scores(de, fundamentals, sentiment, satellite_candidates)
+                top_assets = [t for t, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:TOP_N_SATELLITE]]
+                if top_assets:
+                    momentum = de.momentum_12_1()
+                    expected_returns = {t: momentum.get(t, 0.0) for t in top_assets}
+                    cov = de.covariance_matrix(top_assets)
+                    sat_weights = optimize_weights(expected_returns, cov, satellite_weight)
+                    for ticker, weight in sat_weights.items():
+                        rebalance_to_target(
+                            trading_client, stock_data_client, positions,
+                            total_equity, cash_available, ticker, weight, is_core=False
+                        )
+            elif exit_satellite and can_trade_today():
+                # Exit satellite sleeve
+                for symbol, p in positions.items():
+                    if symbol in SECTOR_TICKERS or symbol in stock_universe:
+                        order = MarketOrderRequest(
+                            symbol=symbol,
+                            qty=abs(float(p.qty)),
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                        )
+                        submit_order_safe(trading_client, order, label=f"EXIT satellite {symbol}")
+                log.warning("Satellite sleeve exited due to portfolio drawdown.")
 
             # 4. HEDGE SLEEVE
             etf_hedge_weight = hedge_weight * (1 - PUT_HEDGE_SHARE)
@@ -824,7 +1016,6 @@ def trading_bot_loop():
                 options_pct = check_options_exposure(positions, total_equity)
                 if options_pct < MAX_OPTIONS_PCT_OF_EQUITY:
                     opt_summary = options_position_summary(list(positions.values()))
-
                     per_underlying_budget = put_budget / max(len(OPTION_UNIVERSE), 1)
 
                     for underlying in OPTION_UNIVERSE:
