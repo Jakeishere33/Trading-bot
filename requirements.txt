@@ -1,7 +1,7 @@
 flask
-alpaca-trade-api
-gunicorn
-yfinance
-pandas
 numpy
+pandas
+yfinance
 scipy
+alpaca-trade-api
+vaderSentiment
