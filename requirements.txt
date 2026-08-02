@@ -1,7 +1,8 @@
-flask
-numpy
-pandas
-yfinance
-scipy
-alpaca-py
-vaderSentiment
+flask==3.0.3
+gunicorn==22.0.0
+numpy==1.26.4
+pandas==2.2.2
+yfinance==0.2.43
+scipy==1.13.1
+alpaca-py==0.30.1
+vaderSentiment==3.3.2
