@@ -4,11 +4,13 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m gunicorn trading_bot:app --bind 0.0.0.0:$PORT
+    startCommand: gunicorn trading_bot:app --workers 1 --bind 0.0.0.0:$PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: ALPACA_PAPER_KEY
+      - key: ALPACA_API_KEY
         sync: false
-      - key: ALPACA_PAPER_SECRET
+      - key: ALPACA_API_SECRET
         sync: false
+      - key: ALPACA_PAPER
+        value: "true"
