@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import random
 import threading
 import logging
 from datetime import date, timedelta, datetime
@@ -96,7 +97,13 @@ VIX_TICKER = "^VIX"
 
 SATELLITE_HEDGE_TOTAL = 1.0 - CORE_TOTAL_WEIGHT   # 0.30
 MIN_HEDGE_WEIGHT = 0.02
-MAX_HEDGE_WEIGHT = 0.07   # hedge < 7% of portfolio
+MAX_HEDGE_WEIGHT = 0.07   # hedge < 7% of portfolio (per instrument)
+
+# Split the 30% satellite+hedge sleeve between the two purposes.
+# (Previously the code accidentally gave the hedges the entire sleeve,
+# leaving nothing for sector satellites — fixed by explicitly splitting it.)
+HEDGE_SLEEVE_WEIGHT = 0.10
+SATELLITE_SLEEVE_WEIGHT = SATELLITE_HEDGE_TOTAL - HEDGE_SLEEVE_WEIGHT  # 0.20
 
 # Options overlay config
 OPTIONS_ENABLED = True
@@ -157,6 +164,55 @@ MAX_CORRELATION = 0.85
 
 # Eastern timezone used for all market-hours logic below
 EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+# ============================================================
+# YFINANCE RETRY WRAPPER (handles rate limiting)
+# ============================================================
+
+YF_MAX_RETRIES = 4
+YF_BASE_DELAY_SECONDS = 3.0
+
+
+def yf_call_with_retry(func, *args, max_retries=YF_MAX_RETRIES, base_delay=YF_BASE_DELAY_SECONDS, **kwargs):
+    """
+    Call a yfinance-backed function with exponential backoff + jitter on
+    rate-limit errors. Non-rate-limit errors are raised immediately (no
+    point retrying a bad ticker or a genuine network failure the same way).
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exc = e
+            msg = str(e)
+            is_rate_limit = (
+                "Rate limit" in msg
+                or "Too Many Requests" in msg
+                or "YFRateLimitError" in type(e).__name__
+            )
+            if not is_rate_limit or attempt == max_retries - 1:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1.5)
+            log.warning(
+                f"yfinance rate limited, retrying in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{max_retries})..."
+            )
+            time.sleep(delay)
+    raise last_exc
+
+
+def yf_download(*args, **kwargs):
+    return yf_call_with_retry(yf.download, *args, **kwargs)
+
+
+def yf_ticker_info(ticker):
+    return yf_call_with_retry(lambda: yf.Ticker(ticker).info)
+
+
+def yf_ticker_news(ticker):
+    return yf_call_with_retry(lambda: yf.Ticker(ticker).news)
 
 
 # ============================================================
@@ -250,7 +306,7 @@ def filter_liquid_stocks(tickers):
     liquid = []
     for t in tickers:
         try:
-            info = yf.Ticker(t).info
+            info = yf_ticker_info(t)
             if (
                 info.get("averageVolume", 0) >= MIN_STOCK_VOLUME
                 and info.get("marketCap", 0) >= MIN_STOCK_MARKET_CAP
@@ -260,6 +316,7 @@ def filter_liquid_stocks(tickers):
         except Exception as e:
             log.warning(f"Liquidity filter failed for {t}: {e}")
             continue
+        time.sleep(0.3)
     log.info(f"Filtered liquid NYSE/NASDAQ stocks: {len(liquid)}")
     return liquid
 
@@ -296,7 +353,7 @@ class DataEngine:
 
     def fetch(self):
         log.info(f"Downloading {self.years}y of history for {len(self.tickers)} tickers...")
-        raw = yf.download(
+        raw = yf_download(
             self.tickers, period=f"{self.years}y",
             auto_adjust=True, progress=False, group_by="column", threads=False,
         )
@@ -372,7 +429,7 @@ class FundamentalAnalyzer:
         if ticker in self._cache:
             return self._cache[ticker]
         try:
-            info = yf.Ticker(ticker).info or {}
+            info = yf_ticker_info(ticker) or {}
         except Exception as e:
             log.warning(f"Fundamentals fetch failed for {ticker}: {e}")
             info = {}
@@ -405,7 +462,7 @@ class NewsSentimentAnalyzer:
 
     def score(self, ticker, max_headlines=8):
         try:
-            news_items = yf.Ticker(ticker).news or []
+            news_items = yf_ticker_news(ticker) or []
         except Exception as e:
             log.warning(f"News fetch failed for {ticker}: {e}")
             return 0.0
@@ -439,8 +496,16 @@ def composite_scores(data_engine, fundamentals, sentiment, tickers, weights=None
     weights = weights or {"sharpe": 0.35, "momentum": 0.30, "fundamentals": 0.20, "sentiment": 0.15}
     sharpe = zscore({t: v for t, v in data_engine.sharpe_ratios().items() if t in tickers})
     momentum = zscore({t: v for t, v in data_engine.momentum_12_1().items() if t in tickers})
-    fund = zscore({t: fundamentals.score(t) for t in tickers})
-    sent = zscore({t: sentiment.score(t) for t in tickers})
+
+    fund_raw = {}
+    sent_raw = {}
+    for t in tickers:
+        fund_raw[t] = fundamentals.score(t)
+        time.sleep(0.2)
+        sent_raw[t] = sentiment.score(t)
+        time.sleep(0.2)
+    fund = zscore(fund_raw)
+    sent = zscore(sent_raw)
 
     scores = {}
     for t in tickers:
@@ -451,6 +516,34 @@ def composite_scores(data_engine, fundamentals, sentiment, tickers, weights=None
             + weights["sentiment"] * sent.get(t, 0.0)
         )
     return scores
+
+
+def select_satellite_weights(data_engine, scores, sector_tickers, top_n=TOP_N_SATELLITE, total_weight=SATELLITE_SLEEVE_WEIGHT):
+    """
+    Pick the top-N scoring sector ETFs and size them with the mean-variance
+    optimizer (correlation-capped) over the satellite sleeve's weight budget.
+    Falls back to equal weighting if covariance data isn't usable.
+    """
+    ranked = sorted(sector_tickers, key=lambda t: scores.get(t, -1e9), reverse=True)
+    top = [t for t in ranked[:top_n] if t in scores]
+    if not top:
+        return {}
+
+    try:
+        cov = data_engine.covariance_matrix(top)
+        cov_ok = not cov.isnull().values.any() and cov.shape[0] == len(top)
+    except Exception as e:
+        log.warning(f"Satellite covariance matrix failed, falling back to equal weight: {e}")
+        cov_ok = False
+
+    if cov_ok and len(top) > 1:
+        expected_returns = {t: scores[t] for t in top}
+        weights = optimize_weights(expected_returns, cov, total_weight, max_weight_per_asset=MAX_SATELLITE_WEIGHT)
+    else:
+        per = total_weight / len(top)
+        weights = {t: min(per, MAX_SATELLITE_WEIGHT) for t in top}
+
+    return weights
 
 
 # ============================================================
@@ -532,7 +625,7 @@ class RiskManager:
             drawdown = 1.0 - (last / last_year.max())
             score_components.append(float(np.clip(drawdown / 0.20, 0, 1)))
         try:
-            vix_hist = yf.download(VIX_TICKER, period="6mo", progress=False, auto_adjust=True)["Close"]
+            vix_hist = yf_download(VIX_TICKER, period="6mo", progress=False, auto_adjust=True)["Close"]
             vix_level = float(vix_hist.iloc[-1])
             score_components.append(float(np.clip((vix_level - 15) / 20, 0, 1)))
         except Exception as e:
@@ -541,7 +634,7 @@ class RiskManager:
 
     def current_vix_level(self):
         try:
-            vix_hist = yf.download(VIX_TICKER, period="5d", progress=False, auto_adjust=True)["Close"]
+            vix_hist = yf_download(VIX_TICKER, period="5d", progress=False, auto_adjust=True)["Close"]
             return float(vix_hist.iloc[-1])
         except Exception as e:
             log.warning(f"VIX fetch failed for throttle: {e}")
@@ -756,7 +849,7 @@ def get_price(stock_data_client, ticker):
 
 def stock_liquidity_ok(ticker):
     try:
-        info = yf.Ticker(ticker).info
+        info = yf_ticker_info(ticker)
         bid = info.get("bid", None)
         ask = info.get("ask", None)
         if bid is None or ask is None or bid <= 0 or ask <= 0:
@@ -945,7 +1038,7 @@ def get_daily_market_data(tickers):
 
     rm = RiskManager(de)
     regime_score = rm.regime_risk_score()
-    hedge_weights = rm.hedge_weight_breakdown(SATELLITE_HEDGE_TOTAL)
+    hedge_weights = rm.hedge_weight_breakdown(HEDGE_SLEEVE_WEIGHT)
 
     _DATA_CACHE.update({
         "date": today,
@@ -1028,8 +1121,38 @@ def trading_loop():
                     is_core=True,
                 )
 
-            # TODO: satellite selection using scores + optimize_weights
-            # (You can plug in your full satellite logic here.)
+            # Satellite sector selection — top-ranked sector ETFs, sized via
+            # the mean-variance optimizer over the satellite sleeve budget.
+            satellite_weights = select_satellite_weights(de, scores, SECTOR_TICKERS)
+            log.info(f"Satellite weights: {satellite_weights}")
+            for ticker, w in satellite_weights.items():
+                rebalance_to_target(
+                    trading_client,
+                    stock_data_client,
+                    positions,
+                    total_equity,
+                    cash_available,
+                    ticker,
+                    w,
+                    is_core=False,
+                )
+
+            # Hedge sleeve — inverse equity / long bonds / gold, sized by regime.
+            for name, w in hedge_weights.items():
+                symbol = HEDGE_INSTRUMENTS.get(name)
+                if not symbol:
+                    continue
+                w_clamped = float(np.clip(w, MIN_HEDGE_WEIGHT, MAX_HEDGE_WEIGHT))
+                rebalance_to_target(
+                    trading_client,
+                    stock_data_client,
+                    positions,
+                    total_equity,
+                    cash_available,
+                    symbol,
+                    w_clamped,
+                    is_core=False,
+                )
 
             # Options overlay
             if OPTIONS_ENABLED:
