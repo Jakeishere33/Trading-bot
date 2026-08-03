@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 from datetime import date, timedelta, datetime
+from zoneinfo import ZoneInfo
 from math import log, sqrt, exp
 
 import numpy as np
@@ -148,11 +149,14 @@ MIN_HOLD_DAYS = 5
 MAX_TURNOVER_PCT_PER_REBAL = 0.20
 
 # No trade windows (ET time)
-NO_TRADE_BEFORE = (9, 45)   # 9:45 AM
-NO_TRADE_AFTER = (15, 55)   # 3:55 PM
+NO_TRADE_BEFORE = (9, 45)   # 9:45 AM ET
+NO_TRADE_AFTER = (15, 55)   # 3:55 PM ET
 
 # Correlation cap
 MAX_CORRELATION = 0.85
+
+# Eastern timezone used for all market-hours logic below
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 # ============================================================
@@ -169,17 +173,18 @@ def assert_safe_order(symbol: str, asset_class):
 # ============================================================
 
 def now_et():
-    # Assumes server is UTC; adjust if needed
-    return datetime.utcnow()
+    # Real US/Eastern wall-clock time (handles EST/EDT automatically),
+    # regardless of what timezone the server itself runs in.
+    return datetime.now(EASTERN_TZ)
 
 
 def in_no_trade_window():
     t = now_et()
     h, m = t.hour, t.minute
-    # Before first 15 minutes
+    # Before first 15 minutes after the open
     if (h < NO_TRADE_BEFORE[0]) or (h == NO_TRADE_BEFORE[0] and m < NO_TRADE_BEFORE[1]):
         return True
-    # After last 5 minutes
+    # After last 5 minutes before the close
     if (h > NO_TRADE_AFTER[0]) or (h == NO_TRADE_AFTER[0] and m >= NO_TRADE_AFTER[1]):
         return True
     return False
@@ -191,7 +196,7 @@ def in_no_trade_window():
 
 def reset_trade_counter_if_new_day():
     global TRADES_TODAY, LAST_TRADE_DAY
-    today = date.today()
+    today = now_et().date()
     if LAST_TRADE_DAY != today:
         LAST_TRADE_DAY = today
         TRADES_TODAY = 0
@@ -595,7 +600,7 @@ class OptionsEngine:
         self.de = data_engine
 
     def _find_contracts(self, underlying, contract_type, min_dte=OPTIONS_MIN_DTE, max_dte=OPTIONS_MAX_DTE):
-        today = date.today()
+        today = now_et().date()
         req = GetOptionContractsRequest(
             underlying_symbols=[underlying],
             status=AssetStatus.ACTIVE,
@@ -658,7 +663,7 @@ class OptionsEngine:
             return
         assert_safe_order(contract.symbol, AssetClass.US_OPTION)
 
-        T = (contract.expiration_date - date.today()).days / TRADING_DAYS
+        T = (contract.expiration_date - now_et().date()).days / TRADING_DAYS
         sigma = get_underlying_vol(self.de, underlying)
         bs_price = black_scholes_price(
             S=spot_price,
@@ -701,7 +706,7 @@ class OptionsEngine:
             return
         assert_safe_order(contract.symbol, AssetClass.US_OPTION)
 
-        T = (contract.expiration_date - date.today()).days / TRADING_DAYS
+        T = (contract.expiration_date - now_et().date()).days / TRADING_DAYS
         sigma = get_underlying_vol(self.de, underlying)
         bs_price = black_scholes_price(
             S=spot_price,
