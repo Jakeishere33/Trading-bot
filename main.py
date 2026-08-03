@@ -298,7 +298,7 @@ class DataEngine:
         log.info(f"Downloading {self.years}y of history for {len(self.tickers)} tickers...")
         raw = yf.download(
             self.tickers, period=f"{self.years}y",
-            auto_adjust=True, progress=False, group_by="column", threads=True,
+            auto_adjust=True, progress=False, group_by="column", threads=False,
         )
         if isinstance(raw.columns, pd.MultiIndex):
             close = raw["Close"]
@@ -904,6 +904,62 @@ def check_portfolio_drawdown(account, initial_equity):
 
 
 # ============================================================
+# DAILY DATA CACHE (avoids re-hitting yfinance every 5-min loop)
+# ============================================================
+# Historical prices, fundamentals, and news sentiment don't meaningfully
+# change minute to minute. Re-downloading 12y of history + per-ticker
+# fundamentals/news on every 5-minute loop hammers Yahoo Finance and
+# reliably trips its rate limiter. Instead, fetch this bundle once per
+# trading day and reuse it for every loop iteration that day. Only live
+# prices (fetched from Alpaca, not Yahoo) need to be fresh every loop.
+_DATA_CACHE = {
+    "date": None,
+    "de": None,
+    "fundamentals": None,
+    "sentiment": None,
+    "scores": None,
+    "regime_score": None,
+    "hedge_weights": None,
+}
+
+
+def get_daily_market_data(tickers):
+    today = now_et().date()
+    if _DATA_CACHE["date"] == today and _DATA_CACHE["de"] is not None:
+        log.info("Using cached market data for today (fetched earlier this trading day).")
+        return (
+            _DATA_CACHE["de"],
+            _DATA_CACHE["fundamentals"],
+            _DATA_CACHE["sentiment"],
+            _DATA_CACHE["scores"],
+            _DATA_CACHE["regime_score"],
+            _DATA_CACHE["hedge_weights"],
+        )
+
+    log.info("Refreshing daily market data cache (history, fundamentals, sentiment, regime)...")
+    de = DataEngine(tickers)
+    de.fetch()
+    fundamentals = FundamentalAnalyzer()
+    sentiment = NewsSentimentAnalyzer()
+    scores = composite_scores(de, fundamentals, sentiment, tickers)
+
+    rm = RiskManager(de)
+    regime_score = rm.regime_risk_score()
+    hedge_weights = rm.hedge_weight_breakdown(SATELLITE_HEDGE_TOTAL)
+
+    _DATA_CACHE.update({
+        "date": today,
+        "de": de,
+        "fundamentals": fundamentals,
+        "sentiment": sentiment,
+        "scores": scores,
+        "regime_score": regime_score,
+        "hedge_weights": hedge_weights,
+    })
+    return de, fundamentals, sentiment, scores, regime_score, hedge_weights
+
+
+# ============================================================
 # MAIN TRADING LOOP (BACKGROUND THREAD)
 # ============================================================
 
@@ -954,17 +1010,8 @@ def trading_loop():
             # tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + liquid_stocks
             tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS
 
-            # Data + scores
-            de = DataEngine(tickers)
-            de.fetch()
-            fundamentals = FundamentalAnalyzer()
-            sentiment = NewsSentimentAnalyzer()
-            scores = composite_scores(de, fundamentals, sentiment, tickers)
-
-            # Risk manager
-            rm = RiskManager(de)
-            regime_score = rm.regime_risk_score()
-            hedge_weights = rm.hedge_weight_breakdown(SATELLITE_HEDGE_TOTAL)
+            # Data + scores (cached once per trading day to avoid yfinance rate limits)
+            de, fundamentals, sentiment, scores, regime_score, hedge_weights = get_daily_market_data(tickers)
 
             log.info(f"Regime score: {regime_score:.3f}, hedge weights: {hedge_weights}")
 
