@@ -943,9 +943,16 @@ def trading_loop():
             cash_available = float(account.cash)
 
             # Universe
-            nyse_nasdaq = get_nyse_nasdaq_universe(trading_client)
-            liquid_stocks = filter_liquid_stocks(nyse_nasdaq)
-            tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + liquid_stocks
+            # NOTE: satellite stock-picking logic is not wired into the loop yet
+            # (see TODO below), so the full NYSE/NASDAQ liquidity scan is skipped
+            # for now — it's a slow, sequential per-ticker yfinance call over
+            # thousands of symbols and would delay the first pass well past the
+            # open for no benefit. Re-enable once satellite selection is implemented:
+            #
+            # nyse_nasdaq = get_nyse_nasdaq_universe(trading_client)
+            # liquid_stocks = filter_liquid_stocks(nyse_nasdaq)
+            # tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + liquid_stocks
+            tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS
 
             # Data + scores
             de = DataEngine(tickers)
