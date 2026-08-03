@@ -1016,11 +1016,23 @@ def trading_loop():
             time.sleep(backoff_seconds)
 
 
+_trading_loop_started = False
+_trading_loop_lock = threading.Lock()
+
+
 def start_background_trading_loop():
+    global _trading_loop_started
+
     def _runner():
-        # Delay so Flask is fully up before heavy work
+        # Delay so Flask/Gunicorn is fully up before heavy work
         time.sleep(5)
         trading_loop()
+
+    with _trading_loop_lock:
+        if _trading_loop_started:
+            log.info("Trading loop already started in this process; skipping duplicate start.")
+            return
+        _trading_loop_started = True
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
@@ -1031,11 +1043,17 @@ def start_background_trading_loop():
 # ENTRYPOINT
 # ============================================================
 
-if __name__ == "__main__":
-    # Start trading loop in background
-    start_background_trading_loop()
+# Start the trading loop at import time. This runs both when the file is
+# executed directly (`python trading_bot.py`) AND when a WSGI server like
+# Gunicorn imports this module and grabs `app` — Gunicorn never sets
+# __name__ == "__main__", so anything inside that guard would silently
+# never run under Gunicorn. The lock above prevents a double-start if
+# multiple Gunicorn workers import this module (keep --workers 1 regardless,
+# so you don't get duplicate order submissions from separate processes).
+start_background_trading_loop()
 
-    # Use PORT from env (Render requirement)
+if __name__ == "__main__":
+    # Local/dev run: use Flask's built-in server directly.
     port = int(os.environ.get("PORT", 10000))
     log.info(f"Starting Flask app on port {port}...")
     app.run(host="0.0.0.0", port=port, threaded=True)
