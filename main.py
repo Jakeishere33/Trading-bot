@@ -363,7 +363,33 @@ class DataEngine:
             close = raw[["Close"]]
             close.columns = self.tickers
         self.close = close.dropna(how="all")
-        self.returns = self.close.pct_change().dropna(how="all")
+
+        # yf.download() swallows per-ticker failures internally (logs them,
+        # returns NaN columns) rather than raising — so the retry wrapper
+        # above never sees them. Detect and retry those tickers individually,
+        # where a single-ticker download does raise on failure and our
+        # backoff wrapper can actually kick in.
+        missing = [
+            t for t in self.tickers
+            if t not in self.close.columns or self.close[t].dropna().empty
+        ]
+        for t in missing:
+            try:
+                log.info(f"Retrying failed ticker {t} individually...")
+                single_raw = yf_call_with_retry(
+                    yf.download, t, period=f"{self.years}y",
+                    auto_adjust=True, progress=False, threads=False,
+                )
+                if isinstance(single_raw.columns, pd.MultiIndex):
+                    s_close = single_raw["Close"].iloc[:, 0]
+                else:
+                    s_close = single_raw["Close"]
+                self.close[t] = s_close
+            except Exception as e:
+                log.warning(f"Individual retry failed for {t}, leaving it out of this cycle: {e}")
+
+        self.close = self.close.dropna(how="all")
+        self.returns = self.close.pct_change(fill_method=None).dropna(how="all")
         return self.close, self.returns
 
     def sharpe_ratios(self):
