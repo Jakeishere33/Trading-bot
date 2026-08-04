@@ -874,24 +874,39 @@ def get_price(stock_data_client, ticker):
 
 
 def stock_liquidity_ok(ticker):
+    """
+    Returns True if the spread check actually passed, or if liquidity data
+    couldn't be fetched at all (e.g. yfinance rate limited) — in which case
+    we proceed but log it clearly, rather than silently blocking a trade on
+    a data-availability problem rather than a real liquidity problem. Only
+    returns False when we actually got quote data and it failed the spread
+    test.
+    """
     try:
         info = yf_ticker_info(ticker)
-        bid = info.get("bid", None)
-        ask = info.get("ask", None)
-        if bid is None or ask is None or bid <= 0 or ask <= 0:
-            return False
-        mid = (bid + ask) / 2.0
-        spread = ask - bid
-        if mid <= 0:
-            return False
-        spread_pct = spread / mid
-        if spread_pct > MAX_STOCK_SPREAD_PCT:
-            log.info(f"Skipping illiquid/wide-spread stock {ticker}: spread_pct={spread_pct:.2%}")
-            return False
-        return True
     except Exception as e:
-        log.warning(f"Stock liquidity check failed for {ticker}: {e}")
+        log.warning(
+            f"Liquidity data unavailable for {ticker} ({e}); "
+            f"proceeding without spread check for this cycle."
+        )
+        return True
+
+    bid = info.get("bid", None)
+    ask = info.get("ask", None)
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        log.warning(
+            f"No usable bid/ask for {ticker}; proceeding without spread check for this cycle."
+        )
+        return True
+    mid = (bid + ask) / 2.0
+    spread = ask - bid
+    if mid <= 0:
+        return True
+    spread_pct = spread / mid
+    if spread_pct > MAX_STOCK_SPREAD_PCT:
+        log.info(f"Skipping illiquid/wide-spread stock {ticker}: spread_pct={spread_pct:.2%}")
         return False
+    return True
 
 
 def rebalance_to_target(
