@@ -170,8 +170,8 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 # YFINANCE RETRY WRAPPER (handles rate limiting)
 # ============================================================
 
-YF_MAX_RETRIES = 4
-YF_BASE_DELAY_SECONDS = 3.0
+YF_MAX_RETRIES = 2
+YF_BASE_DELAY_SECONDS = 2.5
 
 
 def yf_call_with_retry(func, *args, max_retries=YF_MAX_RETRIES, base_delay=YF_BASE_DELAY_SECONDS, **kwargs):
