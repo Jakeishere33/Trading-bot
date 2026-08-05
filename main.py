@@ -105,6 +105,11 @@ MAX_HEDGE_WEIGHT = 0.07   # hedge < 7% of portfolio (per instrument)
 HEDGE_SLEEVE_WEIGHT = 0.10
 SATELLITE_SLEEVE_WEIGHT = SATELLITE_HEDGE_TOTAL - HEDGE_SLEEVE_WEIGHT  # 0.20
 
+# Individual-stock satellite sleeve — carved out of SATELLITE_SLEEVE_WEIGHT
+# so equities can sit alongside sector ETFs in the satellite book.
+STOCK_SLEEVE_SHARE_OF_SATELLITE = 0.40  # 40% of the satellite budget -> single names
+TOP_N_STOCKS = 5
+
 # Options overlay config
 OPTIONS_ENABLED = True
 CALL_OTM_PCT = 0.03
@@ -114,6 +119,31 @@ OPTIONS_MAX_DTE = 45
 PUT_HEDGE_SHARE = 0.25
 OPTIONS_RUN_INTERVAL_SECONDS = 24 * 3600
 MAX_OPTIONS_PCT_OF_EQUITY = 2.0   # options <= 2% of equity
+COVERED_CALL_MIN_SHARES = 100     # 1 option contract = 100 shares
+
+# ---- Short equity sleeve ----
+# A small, separately-capped sleeve for outright short equity positions,
+# sized off the worst-ranked names in the liquid equity universe. Requires
+# a margin account with shorting enabled on Alpaca — orders simply fail
+# (and get logged) if the account doesn't support it.
+SHORT_SLEEVE_WEIGHT = 0.05         # 5% of equity, short-side risk budget AT NEUTRAL regime
+MIN_SHORT_SLEEVE_MULTIPLIER = 0.3  # in strongly bullish regimes, shrink the short sleeve to 30% of base
+MAX_SHORT_SLEEVE_MULTIPLIER = 1.6  # in strongly bearish regimes, scale it up to 160% of base
+MAX_SHORT_POSITION_WEIGHT = 0.03   # no single short > 3% of equity
+MAX_SHORT_EXPOSURE_PCT = 8.0       # hard cap: total short mkt value <= 8% of equity
+TOP_N_SHORTS = 3
+SHORT_STOP_LOSS_PCT = 0.15         # cover if price rises 15% against the short
+
+# ---- Additional options legs: long calls (speculative) + short puts (cash-secured) ----
+CALL_LONG_OTM_PCT = 0.05                 # long calls bought ~5% OTM
+PUT_LONG_OTM_PCT = 0.05                  # speculative long puts bought ~5% OTM
+PUT_SHORT_OTM_PCT = 0.10                 # short puts sold ~10% OTM (reduce assignment odds)
+LONG_CALL_BUDGET_PCT_OF_EQUITY = 0.02    # total speculative long-call budget
+LONG_PUT_BUDGET_PCT_OF_EQUITY = 0.02     # total speculative long-put budget
+SHORT_PUT_CASH_RESERVE_PCT = 0.05        # cash reserved for potential assignment
+TOP_N_LONG_CALLS = 3
+TOP_N_LONG_PUTS = 3
+TOP_N_SHORT_PUTS = 3
 
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
 
@@ -862,6 +892,139 @@ class OptionsEngine:
             f"(BS={bs_price:.2f}, hedge sleeve)"
         )
 
+    def buy_long_calls(self, underlying, spot_price, dollar_budget, existing_long_call_qty=0):
+        """
+        Speculative directional long calls. Sized purely off dollar_budget —
+        max loss is the premium paid, so unlike covered calls / protective
+        puts this doesn't need to be linked to an existing share count.
+        """
+        if spot_price <= 0 or dollar_budget <= 0:
+            return
+        candidates = self._find_contracts(underlying, ContractType.CALL)
+        contract = self._closest_strike(candidates, spot_price * (1 + CALL_LONG_OTM_PCT))
+        if not contract:
+            return
+        assert_safe_order(contract.symbol, AssetClass.US_OPTION)
+
+        T = (contract.expiration_date - now_et().date()).days / TRADING_DAYS
+        sigma = get_underlying_vol(self.de, underlying)
+        bs_price = black_scholes_price(
+            S=spot_price, K=float(contract.strike_price), T=T,
+            r=RISK_FREE_ANNUAL, sigma=sigma, option_type="call",
+        )
+
+        bid, ask = self._quote(contract.symbol)
+        use_price = ask if ask and ask > 0 else bs_price
+        if not self._option_liquidity_ok(contract, bid, ask):
+            return
+        if use_price <= 0:
+            return
+
+        qty = int(dollar_budget // (use_price * 100))
+        if qty <= 0:
+            return
+
+        order = LimitOrderRequest(
+            symbol=contract.symbol, qty=qty, side=OrderSide.BUY, type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY, limit_price=round(use_price, 2),
+        )
+        submit_order_safe(self.trading, order, label=f"BUY long calls {contract.symbol}")
+        log.info(
+            f"BUY {qty} long call(s) {contract.symbol} @ {use_price:.2f} "
+            f"(BS={bs_price:.2f}, speculative)"
+        )
+
+    def buy_speculative_puts(self, underlying, spot_price, dollar_budget, existing_long_put_qty=0):
+        """
+        Speculative long puts — a directional bearish bet, distinct from
+        buy_protective_puts() which hedges shares actually held. This is
+        sized purely off dollar_budget (max loss = premium paid), used on
+        names with a negative composite score rather than names in the
+        long book.
+        """
+        if spot_price <= 0 or dollar_budget <= 0:
+            return
+        candidates = self._find_contracts(underlying, ContractType.PUT)
+        contract = self._closest_strike(candidates, spot_price * (1 - PUT_LONG_OTM_PCT))
+        if not contract:
+            return
+        assert_safe_order(contract.symbol, AssetClass.US_OPTION)
+
+        T = (contract.expiration_date - now_et().date()).days / TRADING_DAYS
+        sigma = get_underlying_vol(self.de, underlying)
+        bs_price = black_scholes_price(
+            S=spot_price, K=float(contract.strike_price), T=T,
+            r=RISK_FREE_ANNUAL, sigma=sigma, option_type="put",
+        )
+
+        bid, ask = self._quote(contract.symbol)
+        use_price = ask if ask and ask > 0 else bs_price
+        if not self._option_liquidity_ok(contract, bid, ask):
+            return
+        if use_price <= 0:
+            return
+
+        qty = int(dollar_budget // (use_price * 100))
+        if qty <= 0:
+            return
+
+        order = LimitOrderRequest(
+            symbol=contract.symbol, qty=qty, side=OrderSide.BUY, type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY, limit_price=round(use_price, 2),
+        )
+        submit_order_safe(self.trading, order, label=f"BUY speculative puts {contract.symbol}")
+        log.info(
+            f"BUY {qty} speculative put(s) {contract.symbol} @ {use_price:.2f} "
+            f"(BS={bs_price:.2f}, bearish alpha)"
+        )
+
+    def sell_short_puts(self, underlying, spot_price, cash_reserve_available, existing_short_put_qty=0):
+        """
+        Cash-secured short puts only. Sized so that qty * strike * 100 never
+        exceeds cash_reserve_available — i.e. capped at what could actually
+        be paid in cash if assigned, not margin. This deliberately avoids
+        naked/undefined downside. Assignment still means being forced to buy
+        the stock at the strike, so PUT_SHORT_OTM_PCT is kept wide enough
+        that this is a deliberate, acceptable outcome rather than a surprise.
+        """
+        if spot_price <= 0 or cash_reserve_available <= 0:
+            return
+        candidates = self._find_contracts(underlying, ContractType.PUT)
+        contract = self._closest_strike(candidates, spot_price * (1 - PUT_SHORT_OTM_PCT))
+        if not contract:
+            return
+        assert_safe_order(contract.symbol, AssetClass.US_OPTION)
+
+        strike = float(contract.strike_price)
+        T = (contract.expiration_date - now_et().date()).days / TRADING_DAYS
+        sigma = get_underlying_vol(self.de, underlying)
+        bs_price = black_scholes_price(
+            S=spot_price, K=strike, T=T,
+            r=RISK_FREE_ANNUAL, sigma=sigma, option_type="put",
+        )
+
+        bid, ask = self._quote(contract.symbol)
+        use_price = bid if bid and bid > 0 else bs_price
+        if not self._option_liquidity_ok(contract, bid, ask):
+            return
+        if use_price <= 0 or strike <= 0:
+            return
+
+        max_assignable_qty = int(cash_reserve_available // (strike * 100))
+        qty = max_assignable_qty
+        if qty <= 0:
+            return
+
+        order = LimitOrderRequest(
+            symbol=contract.symbol, qty=qty, side=OrderSide.SELL, type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY, limit_price=round(use_price, 2),
+        )
+        submit_order_safe(self.trading, order, label=f"SELL short puts {contract.symbol}")
+        log.info(
+            f"SELL {qty} short put(s) {contract.symbol} @ {use_price:.2f} "
+            f"(BS={bs_price:.2f}, cash-secured, strike={strike})"
+        )
+
 
 # ============================================================
 # EXECUTION LAYER
@@ -948,9 +1111,62 @@ def rebalance_to_target(
         log.info(f"BUY {qty} {ticker} toward target weight {target_weight:.3f}")
 
 
+def rebalance_short_to_target(
+    trading_client,
+    stock_data_client,
+    positions,
+    total_equity,
+    ticker,
+    target_weight,
+):
+    """
+    Opens/increases a short equity position toward target_weight (a positive
+    weight representing dollar short exposure). This only ever *sells to
+    open/add to* a short — it never touches a ticker already held long
+    elsewhere in the portfolio, so it can't accidentally liquidate a long
+    position instead of opening a short.
+    """
+    target_weight = min(target_weight, MAX_SHORT_POSITION_WEIGHT)
+    target_value = total_equity * target_weight
+    if target_value <= 0:
+        return
+
+    pos = positions.get(ticker)
+    if pos is not None and getattr(pos, "side", None) != "short":
+        # Already held long here — never short a name we're also long.
+        return
+
+    current_short_value = abs(float(pos.market_value)) if pos is not None else 0.0
+    drift = abs(current_short_value - target_value) / target_value if target_value else 1.0
+    if drift < REBALANCE_BAND or current_short_value >= target_value:
+        return
+
+    try:
+        price = get_price(stock_data_client, ticker)
+    except Exception as e:
+        log.warning(f"Price fetch failed for {ticker} (short): {e}")
+        return
+    if price <= 0:
+        return
+    if not stock_liquidity_ok(ticker):
+        return
+
+    qty = int((target_value - current_short_value) // price)
+    if qty > 0 and can_trade_today():
+        assert_safe_order(ticker, AssetClass.US_EQUITY)
+        order = MarketOrderRequest(symbol=ticker, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+        submit_order_safe(trading_client, order, label=f"SHORT {ticker} toward {target_weight:.3f}")
+        log.info(f"SELL SHORT {qty} {ticker} toward target short weight {target_weight:.3f}")
+
+
 def apply_trailing_stops(trading_client, positions):
     for symbol, pos in list(positions.items()):
         if pos.asset_class != AssetClass.US_EQUITY:
+            continue
+        if getattr(pos, "side", None) == "short":
+            # A trailing *sell* stop is backwards for a short position (it
+            # would add to the short, not protect it). Shorts get their own
+            # buy-side stop in apply_short_stop_losses() instead.
             continue
         open_orders = trading_client.get_orders(
             GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
@@ -976,6 +1192,18 @@ def check_options_exposure(positions, total_equity):
     pct = (options_equity / total_equity) * 100 if total_equity else 0
     if pct > MAX_OPTIONS_PCT_OF_EQUITY:
         log.warning(f"Options exposure {pct:.1f}% exceeds {MAX_OPTIONS_PCT_OF_EQUITY}% cap. Blocking new options orders.")
+    return pct
+
+
+def check_short_exposure(positions, total_equity):
+    short_equity = sum(
+        abs(float(p.market_value))
+        for p in positions.values()
+        if p.asset_class == AssetClass.US_EQUITY and getattr(p, "side", None) == "short"
+    )
+    pct = (short_equity / total_equity) * 100 if total_equity else 0
+    if pct > MAX_SHORT_EXPOSURE_PCT:
+        log.warning(f"Short exposure {pct:.1f}% exceeds {MAX_SHORT_EXPOSURE_PCT}% cap. Blocking new short orders.")
     return pct
 
 
@@ -1017,6 +1245,39 @@ def check_position_losses(trading_client, positions):
             log.warning(f"Position loss check failed for {symbol}: {e}")
 
 
+def apply_short_stop_losses(trading_client, positions):
+    """
+    Mirror of check_position_losses for the short side: a short loses money
+    when price rises, so cover (buy to close) once the adverse move exceeds
+    SHORT_STOP_LOSS_PCT. Long positions are untouched here — they're already
+    handled by check_position_losses.
+    """
+    for symbol, p in positions.items():
+        if p.asset_class != AssetClass.US_EQUITY or getattr(p, "side", None) != "short":
+            continue
+        try:
+            cost_basis = float(p.avg_entry_price)
+            qty = abs(float(p.qty))
+            if cost_basis <= 0 or qty <= 0:
+                continue
+            market_price = abs(float(p.market_value)) / qty
+            adverse_move_pct = (market_price - cost_basis) / cost_basis
+            if adverse_move_pct >= SHORT_STOP_LOSS_PCT and can_trade_today():
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC,
+                )
+                submit_order_safe(
+                    trading_client, order,
+                    label=f"COVER SHORT {symbol} due to adverse move {adverse_move_pct:.2%}",
+                )
+                log.warning(f"COVER SHORT {symbol}: price up {adverse_move_pct:.2%} against short position")
+        except Exception as e:
+            log.warning(f"Short stop-loss check failed for {symbol}: {e}")
+
+
 def check_portfolio_drawdown(account, initial_equity):
     """
     Simple portfolio drawdown kill-switch.
@@ -1054,10 +1315,11 @@ _DATA_CACHE = {
     "scores": None,
     "regime_score": None,
     "hedge_weights": None,
+    "liquid_stocks": None,
 }
 
 
-def get_daily_market_data(tickers):
+def get_daily_market_data(trading_client, base_tickers):
     today = now_et().date()
     if _DATA_CACHE["date"] == today and _DATA_CACHE["de"] is not None:
         log.info("Using cached market data for today (fetched earlier this trading day).")
@@ -1068,9 +1330,25 @@ def get_daily_market_data(tickers):
             _DATA_CACHE["scores"],
             _DATA_CACHE["regime_score"],
             _DATA_CACHE["hedge_weights"],
+            _DATA_CACHE["liquid_stocks"],
         )
 
-    log.info("Refreshing daily market data cache (history, fundamentals, sentiment, regime)...")
+    log.info("Refreshing daily market data cache (history, fundamentals, sentiment, regime, universe)...")
+
+    # Pull + liquidity-filter the NYSE/NASDAQ stock universe once per day.
+    # This is what actually lets individual equities into the satellite
+    # sleeve (previously this scan was disabled and the bot only ever
+    # considered ETFs). It's a slow, sequential yfinance scan, so it's
+    # capped and only run once per trading day via this cache.
+    try:
+        raw_universe = get_nyse_nasdaq_universe(trading_client)
+        liquid_stocks = filter_liquid_stocks(raw_universe)
+    except Exception as e:
+        log.warning(f"Equity universe scan failed, continuing with ETFs only: {e}")
+        liquid_stocks = []
+
+    tickers = list(dict.fromkeys(base_tickers + liquid_stocks))
+
     de = DataEngine(tickers)
     de.fetch()
     fundamentals = FundamentalAnalyzer()
@@ -1089,8 +1367,55 @@ def get_daily_market_data(tickers):
         "scores": scores,
         "regime_score": regime_score,
         "hedge_weights": hedge_weights,
+        "liquid_stocks": liquid_stocks,
     })
-    return de, fundamentals, sentiment, scores, regime_score, hedge_weights
+    return de, fundamentals, sentiment, scores, regime_score, hedge_weights, liquid_stocks
+
+
+def select_stock_weights(data_engine, scores, stock_tickers, top_n=TOP_N_STOCKS, total_weight=0.0):
+    """
+    Same approach as select_satellite_weights but over the individual-equity
+    universe, sized within its own carve-out of the satellite sleeve so it
+    never crowds out the sector ETFs.
+    """
+    if total_weight <= 0 or not stock_tickers:
+        return {}
+    ranked = sorted(stock_tickers, key=lambda t: scores.get(t, -1e9), reverse=True)
+    top = [t for t in ranked[:top_n] if t in scores and scores[t] > 0]
+    if not top:
+        return {}
+
+    try:
+        cov = data_engine.covariance_matrix(top)
+        cov_ok = not cov.isnull().values.any() and cov.shape[0] == len(top)
+    except Exception as e:
+        log.warning(f"Stock-sleeve covariance matrix failed, falling back to equal weight: {e}")
+        cov_ok = False
+
+    if cov_ok and len(top) > 1:
+        expected_returns = {t: scores[t] for t in top}
+        weights = optimize_weights(expected_returns, cov, total_weight, max_weight_per_asset=MAX_SATELLITE_WEIGHT)
+    else:
+        per = total_weight / len(top)
+        weights = {t: min(per, MAX_SATELLITE_WEIGHT) for t in top}
+
+    return weights
+
+
+def select_short_weights(scores, candidate_tickers, exclude_tickers, top_n=TOP_N_SHORTS, total_weight=SHORT_SLEEVE_WEIGHT):
+    """
+    Picks the worst-scoring names (excluding anything already held long
+    elsewhere) to short. Equal-weighted and capped per name rather than
+    mean-variance optimized — this is a smaller, higher-risk sleeve that
+    doesn't need the same treatment as the long sleeves.
+    """
+    eligible = [t for t in candidate_tickers if t not in exclude_tickers]
+    ranked = sorted(eligible, key=lambda t: scores.get(t, 1e9))  # ascending: worst first
+    worst = [t for t in ranked[:top_n] if t in scores and scores[t] < 0]
+    if not worst:
+        return {}
+    per = total_weight / len(worst)
+    return {t: min(per, MAX_SHORT_POSITION_WEIGHT) for t in worst}
 
 
 # ============================================================
@@ -1132,22 +1457,21 @@ def trading_loop():
             total_equity = float(account.equity)
             cash_available = float(account.cash)
 
-            # Universe
-            # NOTE: satellite stock-picking logic is not wired into the loop yet
-            # (see TODO below), so the full NYSE/NASDAQ liquidity scan is skipped
-            # for now — it's a slow, sequential per-ticker yfinance call over
-            # thousands of symbols and would delay the first pass well past the
-            # open for no benefit. Re-enable once satellite selection is implemented:
-            #
-            # nyse_nasdaq = get_nyse_nasdaq_universe(trading_client)
-            # liquid_stocks = filter_liquid_stocks(nyse_nasdaq)
-            # tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS + liquid_stocks
-            tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS
+            # Universe: core ETFs + sector ETFs, plus the liquid NYSE/NASDAQ
+            # equity universe (fetched/filtered once per day inside
+            # get_daily_market_data). This is what lets individual stocks
+            # into the satellite sleeve alongside the sector ETFs.
+            base_tickers = list(CORE_ETFS.keys()) + SECTOR_TICKERS
 
             # Data + scores (cached once per trading day to avoid yfinance rate limits)
-            de, fundamentals, sentiment, scores, regime_score, hedge_weights = get_daily_market_data(tickers)
+            de, fundamentals, sentiment, scores, regime_score, hedge_weights, liquid_stocks = (
+                get_daily_market_data(trading_client, base_tickers)
+            )
 
-            log.info(f"Regime score: {regime_score:.3f}, hedge weights: {hedge_weights}")
+            log.info(
+                f"Regime score: {regime_score:.3f}, hedge weights: {hedge_weights}, "
+                f"liquid equity universe size: {len(liquid_stocks)}"
+            )
 
             # Rebalance core ETFs
             for ticker, w in CORE_ETFS.items():
@@ -1162,10 +1486,17 @@ def trading_loop():
                     is_core=True,
                 )
 
-            # Satellite sector selection — top-ranked sector ETFs, sized via
-            # the mean-variance optimizer over the satellite sleeve budget.
-            satellite_weights = select_satellite_weights(de, scores, SECTOR_TICKERS)
-            log.info(f"Satellite weights: {satellite_weights}")
+            # Satellite sleeve is split between sector ETFs and individual
+            # equities, so single-name stocks can now sit alongside the
+            # sector bets and give the hedge sleeve real diversification
+            # to work with instead of ETFs-only.
+            stock_sleeve_budget = SATELLITE_SLEEVE_WEIGHT * STOCK_SLEEVE_SHARE_OF_SATELLITE
+            sector_sleeve_budget = SATELLITE_SLEEVE_WEIGHT - stock_sleeve_budget
+
+            satellite_weights = select_satellite_weights(
+                de, scores, SECTOR_TICKERS, total_weight=sector_sleeve_budget
+            )
+            log.info(f"Satellite (sector ETF) weights: {satellite_weights}")
             for ticker, w in satellite_weights.items():
                 rebalance_to_target(
                     trading_client,
@@ -1177,6 +1508,56 @@ def trading_loop():
                     w,
                     is_core=False,
                 )
+
+            stock_weights = select_stock_weights(
+                de, scores, liquid_stocks, total_weight=stock_sleeve_budget
+            )
+            log.info(f"Satellite (individual equity) weights: {stock_weights}")
+            for ticker, w in stock_weights.items():
+                rebalance_to_target(
+                    trading_client,
+                    stock_data_client,
+                    positions,
+                    total_equity,
+                    cash_available,
+                    ticker,
+                    w,
+                    is_core=False,
+                )
+
+            # ---- Short equity sleeve ----
+            # Separately-capped short book, drawn from the worst-scoring
+            # names in the liquid equity universe, excluding anything held
+            # long elsewhere in the portfolio — this never shorts a name
+            # the long sleeves are also buying. Sized by the same regime
+            # score that drives TLT/GLD/SH, so it actually functions as a
+            # hedge (more short exposure when the regime is bearish, less
+            # when it's bullish) instead of sitting at a flat weight.
+            long_held_tickers = {s for s, p in positions.items() if getattr(p, "side", None) != "short"}
+            short_universe = [t for t in liquid_stocks if t not in long_held_tickers]
+            short_exposure_pct = check_short_exposure(positions, total_equity)
+            if short_exposure_pct >= MAX_SHORT_EXPOSURE_PCT:
+                log.warning("Short exposure at/above cap; skipping new short orders this cycle.")
+            else:
+                # regime_score is 0 (calm/bullish) .. 1 (stressed/bearish).
+                # Map that onto [MIN_SHORT_SLEEVE_MULTIPLIER, MAX_SHORT_SLEEVE_MULTIPLIER]
+                # around the base SHORT_SLEEVE_WEIGHT.
+                short_regime_multiplier = MIN_SHORT_SLEEVE_MULTIPLIER + regime_score * (
+                    MAX_SHORT_SLEEVE_MULTIPLIER - MIN_SHORT_SLEEVE_MULTIPLIER
+                )
+                short_sleeve_budget = SHORT_SLEEVE_WEIGHT * short_regime_multiplier
+                log.info(
+                    f"Short sleeve budget: {short_sleeve_budget:.3f} "
+                    f"(base {SHORT_SLEEVE_WEIGHT}, regime multiplier {short_regime_multiplier:.2f})"
+                )
+                short_weights = select_short_weights(
+                    scores, short_universe, long_held_tickers, total_weight=short_sleeve_budget
+                )
+                log.info(f"Short equity weights: {short_weights}")
+                for ticker, w in short_weights.items():
+                    rebalance_short_to_target(
+                        trading_client, stock_data_client, positions, total_equity, ticker, w,
+                    )
 
             # Hedge sleeve — inverse equity / long bonds / gold, sized by regime.
             for name, w in hedge_weights.items():
@@ -1195,14 +1576,32 @@ def trading_loop():
                     is_core=False,
                 )
 
-            # Options overlay
+            # Options overlay — income (covered calls) + protection (protective
+            # puts). Puts are sized off the hedge sleeve's dollar budget so the
+            # options book stays inside MAX_OPTIONS_PCT_OF_EQUITY.
             if OPTIONS_ENABLED:
+                options_pct = check_options_exposure(positions, total_equity)
                 opt_engine = OptionsEngine(trading_client, option_data_client, de)
                 opt_summary = options_position_summary(positions_list)
-                # Example: sell covered calls on core ETF positions
-                for symbol, pos in positions.items():
-                    if symbol in CORE_ETFS and float(pos.qty) >= 100:
-                        spot = get_price(stock_data_client, symbol)
+
+                if options_pct >= MAX_OPTIONS_PCT_OF_EQUITY:
+                    log.warning("Options exposure at/above cap; skipping new options orders this cycle.")
+                else:
+                    # Covered calls on any equity or ETF position (core, sector,
+                    # or individual stock) that holds at least one full lot of
+                    # 100 shares — previously this was hard-restricted to
+                    # CORE_ETFS only, which meant it almost never fired unless
+                    # you held >=100 shares of VOO/VXUS/BND specifically.
+                    for symbol, pos in positions.items():
+                        if pos.asset_class != AssetClass.US_EQUITY:
+                            continue
+                        if float(pos.qty) < COVERED_CALL_MIN_SHARES:
+                            continue
+                        try:
+                            spot = get_price(stock_data_client, symbol)
+                        except Exception as e:
+                            log.warning(f"Price fetch failed for {symbol} (covered call): {e}")
+                            continue
                         existing_short_calls = int(opt_summary.get((symbol, "call"), 0))
                         opt_engine.sell_covered_calls(
                             underlying=symbol,
@@ -1211,10 +1610,120 @@ def trading_loop():
                             spot_price=spot,
                         )
 
+                    # Protective puts — hedge the equity/ETF book using the
+                    # hedge sleeve's dollar budget. Previously implemented on
+                    # OptionsEngine but never called from the loop, so no
+                    # downside protection was ever actually bought.
+                    hedge_dollar_budget = total_equity * HEDGE_SLEEVE_WEIGHT * PUT_HEDGE_SHARE
+                    equity_positions = [
+                        (s, p) for s, p in positions.items()
+                        if p.asset_class == AssetClass.US_EQUITY and float(p.qty) >= COVERED_CALL_MIN_SHARES
+                    ]
+                    if equity_positions and hedge_dollar_budget > 0:
+                        # Split the put budget evenly across eligible names so
+                        # no single underlying eats the whole hedge budget.
+                        per_name_budget = hedge_dollar_budget / len(equity_positions)
+                        for symbol, pos in equity_positions:
+                            try:
+                                spot = get_price(stock_data_client, symbol)
+                            except Exception as e:
+                                log.warning(f"Price fetch failed for {symbol} (protective put): {e}")
+                                continue
+                            existing_long_puts = int(opt_summary.get((symbol, "put"), 0))
+                            opt_engine.buy_protective_puts(
+                                underlying=symbol,
+                                shares_to_hedge=float(pos.qty),
+                                existing_long_put_qty=existing_long_puts,
+                                spot_price=spot,
+                                dollar_budget=per_name_budget,
+                            )
+
+                    # Speculative long calls — best-scoring names not
+                    # already core holdings, sized off a small dedicated
+                    # dollar budget (max loss = premium paid).
+                    long_call_budget_total = total_equity * LONG_CALL_BUDGET_PCT_OF_EQUITY
+                    call_candidates = [
+                        t for t in (list(CORE_ETFS.keys()) + liquid_stocks)
+                        if scores.get(t, -1e9) > 0
+                    ]
+                    ranked_calls = sorted(
+                        call_candidates, key=lambda t: scores.get(t, -1e9), reverse=True
+                    )[:TOP_N_LONG_CALLS]
+                    if ranked_calls and long_call_budget_total > 0:
+                        per_name_call_budget = long_call_budget_total / len(ranked_calls)
+                        for symbol in ranked_calls:
+                            try:
+                                spot = get_price(stock_data_client, symbol)
+                            except Exception as e:
+                                log.warning(f"Price fetch failed for {symbol} (long call): {e}")
+                                continue
+                            existing_long_calls = int(opt_summary.get((symbol, "call"), 0))
+                            opt_engine.buy_long_calls(
+                                underlying=symbol,
+                                spot_price=spot,
+                                dollar_budget=per_name_call_budget,
+                                existing_long_call_qty=existing_long_calls,
+                            )
+
+                    # Speculative long puts — mirror of the long-calls block
+                    # above, but expressing bearish conviction on the
+                    # worst-scoring names (the same candidate list driving
+                    # the short-equity sleeve). Distinct from
+                    # buy_protective_puts(), which only hedges shares
+                    # actually held — this is a standalone directional bet.
+                    long_put_budget_total = total_equity * LONG_PUT_BUDGET_PCT_OF_EQUITY
+                    put_speculative_candidates = [
+                        t for t in short_universe if scores.get(t, 1e9) < 0
+                    ]
+                    ranked_puts = sorted(
+                        put_speculative_candidates, key=lambda t: scores.get(t, 1e9)
+                    )[:TOP_N_LONG_PUTS]
+                    if ranked_puts and long_put_budget_total > 0:
+                        per_name_put_budget = long_put_budget_total / len(ranked_puts)
+                        for symbol in ranked_puts:
+                            try:
+                                spot = get_price(stock_data_client, symbol)
+                            except Exception as e:
+                                log.warning(f"Price fetch failed for {symbol} (speculative put): {e}")
+                                continue
+                            existing_spec_puts = int(opt_summary.get((symbol, "put"), 0))
+                            opt_engine.buy_speculative_puts(
+                                underlying=symbol,
+                                spot_price=spot,
+                                dollar_budget=per_name_put_budget,
+                                existing_long_put_qty=existing_spec_puts,
+                            )
+
+                    # Cash-secured short puts — worst-case outcome is being
+                    # assigned the stock at the strike, so this is sized
+                    # only up to cash actually available to cover that (not
+                    # margin), and only on names we'd be OK owning (the same
+                    # well-scored names as the long calls above, not the
+                    # short-sleeve's worst-scoring names).
+                    put_cash_budget_total = min(cash_available, total_equity * SHORT_PUT_CASH_RESERVE_PCT)
+                    put_candidates = ranked_calls[:TOP_N_SHORT_PUTS]
+                    if put_candidates and put_cash_budget_total > 0:
+                        per_name_put_cash = put_cash_budget_total / len(put_candidates)
+                        for symbol in put_candidates:
+                            try:
+                                spot = get_price(stock_data_client, symbol)
+                            except Exception as e:
+                                log.warning(f"Price fetch failed for {symbol} (short put): {e}")
+                                continue
+                            existing_short_puts = int(opt_summary.get((symbol, "put"), 0))
+                            opt_engine.sell_short_puts(
+                                underlying=symbol,
+                                spot_price=spot,
+                                cash_reserve_available=per_name_put_cash,
+                                existing_short_put_qty=existing_short_puts,
+                            )
+
             # Kill-switches
             check_position_losses(trading_client, positions)
+            apply_short_stop_losses(trading_client, positions)
             apply_trailing_stops(trading_client, positions)
             check_options_exposure(positions, total_equity)
+            check_short_exposure(positions, total_equity)
             check_portfolio_drawdown(account, initial_equity)
 
             loop_duration = time.time() - start_ts
