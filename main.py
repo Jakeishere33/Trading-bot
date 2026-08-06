@@ -434,12 +434,13 @@ class LeanTradingEngine:
             self._rebalance_symbol(sym, eq * w, price, pos, "CORE")
 
     # ---- satellite sleeve: top-momentum longs from ETFs + equities ----
-    def run_satellite(self):
+    def run_satellite(self, scores=None):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
-        scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+        if scores is None:
+            scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
         top = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, -1e9), reverse=True)[:TOP_N_LONGS]
         per = SATELLITE_SLEEVE_WEIGHT / max(len(top), 1)
         for sym in top:
@@ -447,16 +448,15 @@ class LeanTradingEngine:
             if price <= 0:
                 continue
             self._rebalance_symbol(sym, eq * per, price, pos, "SAT")
-        del scores
-        gc.collect()
 
     # ---- short sleeve: worst-momentum names from ETFs + equities ----
-    def run_shorts(self):
+    def run_shorts(self, scores=None):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
-        scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+        if scores is None:
+            scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
         worst = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, 1e9))[:TOP_N_SHORTS]
         per = SHORT_SLEEVE_WEIGHT / max(len(worst), 1)
         for sym in worst:
@@ -472,8 +472,6 @@ class LeanTradingEngine:
             assert_safe_order(sym, AssetClass.US_EQUITY)
             order = MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
             submit_order_safe(self.trading, order, f"SHORT {sym}")
-        del scores
-        gc.collect()
 
     # ---- hedge sleeve ----
     def run_hedges(self):
@@ -515,12 +513,33 @@ class LeanTradingEngine:
             return
         regime = self.risk.regime_risk_score()
         log.info("Regime risk score: %.2f", regime)
-        self.run_core()
-        self.run_satellite()
-        self.run_hedges()
+
+        # Momentum scores are shared by the long and short sleeves so we hit
+        # Yahoo Finance once per symbol per cycle instead of twice.
+        momentum_scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+
+        for label, fn in [
+            ("core", self.run_core),
+            ("satellite", lambda: self.run_satellite(momentum_scores)),
+            ("hedges", self.run_hedges),
+        ]:
+            try:
+                fn()
+            except Exception as e:
+                log.exception("Sleeve '%s' failed, continuing: %s", label, e)
+
         if regime > 0.4:
-            self.run_shorts()
-        self.run_options()
+            try:
+                self.run_shorts(momentum_scores)
+            except Exception as e:
+                log.exception("Sleeve 'shorts' failed, continuing: %s", e)
+
+        try:
+            self.run_options()
+        except Exception as e:
+            log.exception("Sleeve 'options' failed, continuing: %s", e)
+
+        del momentum_scores
         gc.collect()
 
 
