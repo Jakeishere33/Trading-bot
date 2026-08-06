@@ -11,8 +11,22 @@ import yfinance as yf
 from flask import Flask
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
+from alpaca.trading.requests import (
+    MarketOrderRequest,
+    LimitOrderRequest,
+    GetOptionContractsRequest,
+)
+from alpaca.trading.enums import (
+    OrderSide,
+    TimeInForce,
+    OrderType,
+    AssetClass,
+    AssetStatus,
+    ContractType,
+)
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.data.enums import OptionsFeed
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("lean_risk_engine")
@@ -264,13 +278,14 @@ class LeanOptionsEngine:
 
     def find_contracts(self, underlying, contract_type):
         today = now_et().date()
-        req = {
-            "underlying_symbols": [underlying],
-            "status": "active",
-            "type": contract_type,
-            "expiration_date_gte": today + timedelta(days=OPTIONS_MIN_DTE),
-            "expiration_date_lte": today + timedelta(days=OPTIONS_MAX_DTE),
-        }
+        ctype = ContractType.CALL if contract_type == "call" else ContractType.PUT
+        req = GetOptionContractsRequest(
+            underlying_symbols=[underlying],
+            status=AssetStatus.ACTIVE,
+            type=ctype,
+            expiration_date_gte=today + timedelta(days=OPTIONS_MIN_DTE),
+            expiration_date_lte=today + timedelta(days=OPTIONS_MAX_DTE),
+        )
         try:
             resp = self.trading.get_option_contracts(req)
             return list(resp.option_contracts)
@@ -280,7 +295,8 @@ class LeanOptionsEngine:
 
     def quote(self, symbol):
         try:
-            q = self.opt.get_option_latest_quote({"symbol_or_symbols": symbol})[symbol]
+            req = OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=OptionsFeed.INDICATIVE)
+            q = self.opt.get_option_latest_quote(req)[symbol]
             return float(q.bid_price), float(q.ask_price)
         except Exception as e:
             log.warning("Option quote failed for %s: %s", symbol, e)
@@ -529,9 +545,11 @@ def trading_loop():
         return
 
     trading_client = TradingClient(api_key, api_secret, paper=paper)
-    option_client = trading_client  # same client handles options
+    # Contract lookup goes through TradingClient; live quotes need the
+    # dedicated options market-data client — they are NOT the same object.
+    option_data_client = OptionHistoricalDataClient(api_key, api_secret)
 
-    engine = LeanTradingEngine(trading_client, option_client)
+    engine = LeanTradingEngine(trading_client, option_data_client)
 
     while True:
         try:
