@@ -1,38 +1,34 @@
 import os
+import gc
 import time
 import logging
 import threading
-from math import sqrt, log, exp
-from datetime import datetime, timedelta, date
+from math import sqrt, log, exp, erf
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from flask import Flask
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-    LimitOrderRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    TimeInForce,
-    OrderType,
-    AssetClass,
-)
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("lean_risk_engine")
 
 app = Flask(__name__)
 
+
 @app.route("/")
 def home():
     return "Lean Global Multi-Factor Risk Engine Online", 200
 
+
 @app.route("/health")
 def health():
     return "OK", 200
+
 
 # ============================================================
 # CONFIG
@@ -43,28 +39,36 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 RISK_FREE_ANNUAL = 0.04
 TRADING_DAYS = 252
 
+# ---- Core long-only sleeve (broad ETFs) ----
 CORE_ETFS = {
-    "VOO": 0.45,
+    "VOO": 0.40,
     "VXUS": 0.15,
     "BND": 0.10,
 }
-CORE_TOTAL_WEIGHT = 0.70
+CORE_TOTAL_WEIGHT = 0.65
 
-SECTOR_TICKERS = [
-    "XLK","XLF","XLV","XLE","XLI","XLB","XLY","XLP","XLU","XLRE","VEU","VWO"
+# ---- Satellite / short universe: sector ETFs + individual equities ----
+SECTOR_ETFS = [
+    "XLK", "XLF", "XLV", "XLE", "XLI", "XLB", "XLY", "XLP", "XLU", "XLRE",
 ]
+EQUITY_UNIVERSE = [
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM",
+    "UNH", "PG", "HD", "COST",
+]
+SATELLITE_UNIVERSE = SECTOR_ETFS + EQUITY_UNIVERSE  # keep this list bounded for memory
 
 SATELLITE_SLEEVE_WEIGHT = 0.20
-HEDGE_SLEEVE_WEIGHT = 0.10
-
-HEDGE_INSTRUMENTS = {
-    "inverse_equity": "SH",
-    "long_duration_bonds": "TLT",
-    "gold": "GLD",
-}
+TOP_N_LONGS = 4
 
 SHORT_SLEEVE_WEIGHT = 0.05
 TOP_N_SHORTS = 3
+
+HEDGE_SLEEVE_WEIGHT = 0.10
+HEDGE_INSTRUMENTS = {
+    "SH": 0.40,   # inverse equity
+    "TLT": 0.35,  # long duration bonds
+    "GLD": 0.25,  # gold
+}
 
 OPTIONS_ENABLED = True
 CALL_OTM_PCT = 0.03
@@ -72,10 +76,11 @@ PUT_OTM_PCT = 0.07
 OPTIONS_MIN_DTE = 25
 OPTIONS_MAX_DTE = 45
 COVERED_CALL_MIN_SHARES = 100
+OPTIONABLE_SYMBOLS = list(CORE_ETFS.keys())  # keep options sleeve small on purpose
 
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
 
-MAX_TRADES_PER_DAY = 500
+MAX_TRADES_PER_DAY = 300
 TRADES_TODAY = 0
 LAST_TRADE_DAY = None
 
@@ -87,12 +92,17 @@ MAX_OPTION_SPREAD_PCT = 0.15
 
 REGIME_BENCHMARK = "VOO"
 
+# yfinance memory hygiene
+MAX_BARS_DAYS = 220  # never request more history than this for any calc
+LOOP_SLEEP_SECONDS = 300
+
 # ============================================================
 # TIME / TRADE WINDOW
 # ============================================================
 
 def now_et():
     return datetime.now(EASTERN_TZ)
+
 
 def in_no_trade_window():
     t = now_et()
@@ -103,6 +113,7 @@ def in_no_trade_window():
         return True
     return False
 
+
 def reset_trade_counter_if_new_day():
     global TRADES_TODAY, LAST_TRADE_DAY
     today = now_et().date()
@@ -111,12 +122,14 @@ def reset_trade_counter_if_new_day():
         TRADES_TODAY = 0
         log.info("New trading day: trade counter reset.")
 
+
 def can_trade_today():
     reset_trade_counter_if_new_day()
     if in_no_trade_window():
         log.info("In no-trade window, skipping trades.")
         return False
     return TRADES_TODAY < MAX_TRADES_PER_DAY
+
 
 def submit_order_safe(trading_client, order_data, label=""):
     global TRADES_TODAY
@@ -134,45 +147,71 @@ def submit_order_safe(trading_client, order_data, label=""):
     except Exception as e:
         log.exception("Order failed (%s): %s", label, e)
 
+
 def assert_safe_order(symbol: str, asset_class):
     if asset_class not in SAFE_ASSET_CLASSES:
         raise ValueError(f"Blocked order for {symbol}: asset class {asset_class} not permitted.")
 
+
 # ============================================================
-# YAHOO FINANCE — LIGHTWEIGHT HELPERS
+# YAHOO FINANCE — LIGHTWEIGHT, MEMORY-BOUNDED HELPERS
 # ============================================================
+# Every call downloads only what it needs, extracts a plain list of floats,
+# then explicitly drops the DataFrame and forces a gc pass. This keeps peak
+# resident memory low enough to run comfortably inside a 512 MB Render plan.
 
 def yf_bars(symbol, days=60):
+    days = min(days, MAX_BARS_DAYS)
     try:
-        df = yf.download(symbol, period=f"{days}d", interval="1d", progress=False)
-        return df["Close"].dropna().tolist()
+        df = yf.download(
+            symbol,
+            period=f"{days}d",
+            interval="1d",
+            progress=False,
+            threads=False,
+            auto_adjust=True,
+        )
+        if df is None or df.empty:
+            return []
+        closes = df["Close"].dropna().astype(float).tolist()
+        return closes
     except Exception as e:
         log.warning("YF failed for %s: %s", symbol, e)
         return []
+    finally:
+        try:
+            del df
+        except Exception:
+            pass
+        gc.collect()
+
 
 def latest_price(symbol):
     bars = yf_bars(symbol, days=5)
     return bars[-1] if bars else 0.0
 
+
 def momentum(symbol, lookback=20):
-    bars = yf_bars(symbol, days=lookback+5)
-    if len(bars) < lookback+1:
+    bars = yf_bars(symbol, days=lookback + 5)
+    if len(bars) < lookback + 1:
         return 0.0
     return (bars[-1] / bars[-lookback]) - 1.0
 
+
 def volatility(symbol, window=14):
-    bars = yf_bars(symbol, days=window+10)
-    if len(bars) < window+1:
+    bars = yf_bars(symbol, days=window + 10)
+    if len(bars) < window + 1:
         return 0.0
     rets = []
     for i in range(1, len(bars)):
-        if bars[i-1] > 0:
-            rets.append((bars[i] / bars[i-1]) - 1.0)
+        if bars[i - 1] > 0:
+            rets.append((bars[i] / bars[i - 1]) - 1.0)
     if len(rets) < window:
         return 0.0
     mean = sum(rets[-window:]) / window
-    var = sum((r - mean)**2 for r in rets[-window:]) / window
+    var = sum((r - mean) ** 2 for r in rets[-window:]) / window
     return sqrt(var) * sqrt(TRADING_DAYS)
+
 
 # ============================================================
 # REGIME / RISK MANAGER (LEAN)
@@ -180,42 +219,42 @@ def volatility(symbol, window=14):
 
 class LeanRiskManager:
     def regime_risk_score(self):
-        bars = yf_bars(REGIME_BENCHMARK, days=220)
+        bars = yf_bars(REGIME_BENCHMARK, days=MAX_BARS_DAYS)
         if len(bars) < 200:
             return 0.3
         sma200 = sum(bars[-200:]) / 200
         last = bars[-1]
         below_sma = 0.0 if last > sma200 else 1.0
-        last_year = bars[-252:]
+        last_year = bars[-252:] if len(bars) >= 252 else bars
         dd = 1.0 - (last / max(last_year))
         dd_score = max(0.0, min(dd / 0.20, 1.0))
         return (below_sma + dd_score) / 2.0
 
     def hedge_weights(self):
-        return {
-            "SH": HEDGE_SLEEVE_WEIGHT * 0.4,
-            "TLT": HEDGE_SLEEVE_WEIGHT * 0.35,
-            "GLD": HEDGE_SLEEVE_WEIGHT * 0.25,
-        }
+        return {sym: HEDGE_SLEEVE_WEIGHT * pct for sym, pct in HEDGE_INSTRUMENTS.items()}
+
 
 # ============================================================
 # BLACK–SCHOLES (LEAN)
 # ============================================================
 
+def _cdf(x):
+    return 0.5 * (1 + erf(x / sqrt(2)))
+
+
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*sqrt(T))
-    d2 = d1 - sigma*sqrt(T)
-    from math import erf
-    def cdf(x): return 0.5*(1+erf(x/sqrt(2)))
+    d1 = (log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
     if opt_type == "call":
-        return S*cdf(d1) - K*exp(-r*T)*cdf(d2)
+        return S * _cdf(d1) - K * exp(-r * T) * _cdf(d2)
     else:
-        return K*exp(-r*T)*cdf(-d2) - S*cdf(-d1)
+        return K * exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
+
 
 # ============================================================
-# OPTIONS ENGINE (LEAN)
+# OPTIONS ENGINE (LEAN) — covered calls + protective puts only
 # ============================================================
 
 class LeanOptionsEngine:
@@ -252,7 +291,7 @@ class LeanOptionsEngine:
             return None
         return sorted(
             contracts,
-            key=lambda c: (abs(float(c.strike_price) - target), c.expiration_date)
+            key=lambda c: (abs(float(c.strike_price) - target), c.expiration_date),
         )[0]
 
     def liquidity_ok(self, contract, bid, ask):
@@ -261,16 +300,16 @@ class LeanOptionsEngine:
             return False
         if not bid or not ask or bid <= 0 or ask <= 0:
             return False
-        mid = (bid+ask)/2
+        mid = (bid + ask) / 2
         if mid <= 0:
             return False
-        return (ask-bid)/mid <= MAX_OPTION_SPREAD_PCT
+        return (ask - bid) / mid <= MAX_OPTION_SPREAD_PCT
 
     def sell_covered_calls(self, underlying, shares, spot):
         if shares < COVERED_CALL_MIN_SHARES or spot <= 0:
             return
         contracts = self.find_contracts(underlying, "call")
-        target = spot*(1+CALL_OTM_PCT)
+        target = spot * (1 + CALL_OTM_PCT)
         c = self.closest_strike(contracts, target)
         if not c:
             return
@@ -291,7 +330,7 @@ class LeanOptionsEngine:
             side=OrderSide.SELL,
             type=OrderType.LIMIT,
             time_in_force=TimeInForce.DAY,
-            limit_price=round(use,2),
+            limit_price=round(use, 2),
         )
         submit_order_safe(self.trading, order, f"SELL covered calls {c.symbol}")
 
@@ -299,7 +338,7 @@ class LeanOptionsEngine:
         if shares < 100 or budget <= 0 or spot <= 0:
             return
         contracts = self.find_contracts(underlying, "put")
-        target = spot*(1-PUT_OTM_PCT)
+        target = spot * (1 - PUT_OTM_PCT)
         c = self.closest_strike(contracts, target)
         if not c:
             return
@@ -311,8 +350,8 @@ class LeanOptionsEngine:
         if not self.liquidity_ok(c, bid, ask):
             return
         use = ask if ask and ask > 0 else fair
-        max_aff = int(budget // (use*100))
-        qty = min(int(shares//100), max_aff)
+        max_aff = int(budget // (use * 100))
+        qty = min(int(shares // 100), max_aff)
         if qty <= 0 or use <= 0:
             return
         order = LimitOrderRequest(
@@ -321,9 +360,10 @@ class LeanOptionsEngine:
             side=OrderSide.BUY,
             type=OrderType.LIMIT,
             time_in_force=TimeInForce.DAY,
-            limit_price=round(use,2),
+            limit_price=round(use, 2),
         )
         submit_order_safe(self.trading, order, f"BUY protective puts {c.symbol}")
+
 
 # ============================================================
 # MAIN TRADING ENGINE
@@ -349,103 +389,89 @@ class LeanTradingEngine:
             log.warning("Failed to fetch positions: %s", e)
             return {}
 
-    # ---- core sleeve ----
+    def _rebalance_symbol(self, sym, target_value, price, pos, label):
+        cur = float(pos.get(sym).market_value) if sym in pos else 0.0
+        diff = target_value - cur
+        if target_value == 0 and cur == 0:
+            return
+        eq = max(self.equity(), 1.0)
+        if abs(diff) / eq < 0.01:
+            return
+        side = OrderSide.BUY if diff > 0 else OrderSide.SELL
+        qty = int(abs(diff) / price)
+        if qty <= 0:
+            return
+        assert_safe_order(sym, AssetClass.US_EQUITY)
+        order = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY)
+        submit_order_safe(self.trading, order, f"{label} {sym}")
+
+    # ---- core sleeve: broad-market ETFs, long only ----
     def run_core(self):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
         for sym, w in CORE_ETFS.items():
-            target = eq*w
             price = latest_price(sym)
             if price <= 0:
                 continue
-            cur = float(pos.get(sym).market_value) if sym in pos else 0.0
-            diff = target - cur
-            if abs(diff)/eq < 0.01:
-                continue
-            side = OrderSide.BUY if diff>0 else OrderSide.SELL
-            qty = int(abs(diff)/price)
-            if qty <= 0:
-                continue
-            assert_safe_order(sym, AssetClass.US_EQUITY)
-            order = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY)
-            submit_order_safe(self.trading, order, f"CORE {sym}")
+            self._rebalance_symbol(sym, eq * w, price, pos, "CORE")
 
-    # ---- satellite sectors ----
+    # ---- satellite sleeve: top-momentum longs from ETFs + equities ----
     def run_satellite(self):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
-        scores = {t: momentum(t,60) for t in SECTOR_TICKERS}
-        top = sorted(SECTOR_TICKERS, key=lambda x: scores.get(x, -1e9), reverse=True)[:3]
-        per = SATELLITE_SLEEVE_WEIGHT / max(len(top),1)
+        scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+        top = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, -1e9), reverse=True)[:TOP_N_LONGS]
+        per = SATELLITE_SLEEVE_WEIGHT / max(len(top), 1)
         for sym in top:
-            target = eq*per
             price = latest_price(sym)
             if price <= 0:
                 continue
-            cur = float(pos.get(sym).market_value) if sym in pos else 0.0
-            diff = target - cur
-            if abs(diff)/eq < 0.01:
-                continue
-            side = OrderSide.BUY if diff>0 else OrderSide.SELL
-            qty = int(abs(diff)/price)
-            if qty <= 0:
-                continue
-            assert_safe_order(sym, AssetClass.US_EQUITY)
-            order = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY)
-            submit_order_safe(self.trading, order, f"SAT {sym}")
+            self._rebalance_symbol(sym, eq * per, price, pos, "SAT")
+        del scores
+        gc.collect()
 
-    # ---- shorts ----
+    # ---- short sleeve: worst-momentum names from ETFs + equities ----
     def run_shorts(self):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
-        scores = {t: momentum(t,60) for t in SECTOR_TICKERS}
-        worst = sorted(SECTOR_TICKERS, key=lambda x: scores.get(x, 1e9))[:TOP_N_SHORTS]
-        per = SHORT_SLEEVE_WEIGHT / max(len(worst),1)
+        scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+        worst = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, 1e9))[:TOP_N_SHORTS]
+        per = SHORT_SLEEVE_WEIGHT / max(len(worst), 1)
         for sym in worst:
             price = latest_price(sym)
             if price <= 0:
                 continue
-            target = eq*per
-            qty = int(target/price)
+            target = eq * per
+            qty = int(target / price)
             if qty <= 0:
                 continue
             if sym in pos and float(pos[sym].qty) > 0:
-                continue
+                continue  # don't short a name we're already long
             assert_safe_order(sym, AssetClass.US_EQUITY)
             order = MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
             submit_order_safe(self.trading, order, f"SHORT {sym}")
+        del scores
+        gc.collect()
 
-    # ---- hedges ----
+    # ---- hedge sleeve ----
     def run_hedges(self):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
-        weights = self.risk.hedge_weights()
-        for sym, w in weights.items():
-            target = eq*w
+        for sym, w in self.risk.hedge_weights().items():
             price = latest_price(sym)
             if price <= 0:
                 continue
-            cur = float(pos.get(sym).market_value) if sym in pos else 0.0
-            diff = target - cur
-            if abs(diff)/eq < 0.01:
-                continue
-            side = OrderSide.BUY if diff>0 else OrderSide.SELL
-            qty = int(abs(diff)/price)
-            if qty <= 0:
-                continue
-            assert_safe_order(sym, AssetClass.US_EQUITY)
-            order = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY)
-            submit_order_safe(self.trading, order, f"HEDGE {sym}")
+            self._rebalance_symbol(sym, eq * w, price, pos, "HEDGE")
 
-    # ---- options ----
+    # ---- options sleeve: covered calls + protective puts on core ETF holdings ----
     def run_options(self):
         if not OPTIONS_ENABLED:
             return
@@ -453,19 +479,21 @@ class LeanTradingEngine:
         if eq <= 0:
             return
         pos = self.positions()
-        for sym in CORE_ETFS.keys():
+        for sym in OPTIONABLE_SYMBOLS:
             if sym not in pos:
                 continue
             shares = float(pos[sym].qty)
+            if shares <= 0:
+                continue  # only write/hedge against long shares
             price = latest_price(sym)
             if price <= 0:
                 continue
             if shares >= COVERED_CALL_MIN_SHARES:
                 self.options.sell_covered_calls(sym, shares, price)
-            put_budget = eq*0.01
+            put_budget = eq * 0.01
             self.options.buy_protective_puts(sym, shares, price, put_budget)
 
-    # ---- main ----
+    # ---- main cycle ----
     def run_once(self):
         if not can_trade_today():
             return
@@ -477,18 +505,31 @@ class LeanTradingEngine:
         if regime > 0.4:
             self.run_shorts()
         self.run_options()
+        gc.collect()
+
 
 # ============================================================
 # BACKGROUND LOOP FOR RENDER
 # ============================================================
 
+def _env_bool(name, default=True):
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 def trading_loop():
-    api_key = os.getenv("ALPACA_API_KEY", "YOUR_KEY")
-    api_secret = os.getenv("ALPACA_API_SECRET", "YOUR_SECRET")
-    paper = True
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    api_secret = os.getenv("ALPACA_API_SECRET", "")
+    paper = _env_bool("ALPACA_PAPER", True)
+
+    if not api_key or not api_secret:
+        log.error("ALPACA_API_KEY / ALPACA_API_SECRET not set — trading loop will not start.")
+        return
 
     trading_client = TradingClient(api_key, api_secret, paper=paper)
-    option_client = trading_client  # same client for options
+    option_client = trading_client  # same client handles options
 
     engine = LeanTradingEngine(trading_client, option_client)
 
@@ -497,6 +538,12 @@ def trading_loop():
             engine.run_once()
         except Exception as e:
             log.exception("Engine error: %s", e)
-        time.sleep(300)
+        gc.collect()
+        time.sleep(LOOP_SLEEP_SECONDS)
+
 
 threading.Thread(target=trading_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
