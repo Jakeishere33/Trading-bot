@@ -4,7 +4,7 @@ import gc
 import time
 import logging
 import threading
-from math import sqrt, log, exp, erf
+from math import sqrt, log as ln, exp, erf
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -320,7 +320,7 @@ def _cdf(x):
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
         return 0.0
-    d1 = (log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T))
+    d1 = (ln(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * sqrt(T))
     d2 = d1 - sigma * sqrt(T)
     if opt_type == "call":
         return S * _cdf(d1) - K * exp(-r * T) * _cdf(d2)
