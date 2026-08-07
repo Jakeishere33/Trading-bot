@@ -119,8 +119,8 @@ SATELLITE_UNIVERSE = _dedupe(SECTOR_ETFS + EQUITY_UNIVERSE + SECTOR_EQUITY_UNIVE
 SATELLITE_SLEEVE_WEIGHT = 0.20
 TOP_N_LONGS = 4
 
-SHORT_SLEEVE_WEIGHT = 0.05
-TOP_N_SHORTS = 3
+SHORT_SLEEVE_WEIGHT = 0.12
+TOP_N_SHORTS = 6
 
 HEDGE_SLEEVE_WEIGHT = 0.10
 HEDGE_INSTRUMENTS = {
@@ -583,7 +583,7 @@ class LeanTradingEngine:
             except Exception as e:
                 log.exception("Sleeve '%s' failed, continuing: %s", label, e)
 
-        if regime > 0.4:
+        if regime > 0.15:
             try:
                 self.run_shorts(momentum_scores)
             except Exception as e:
