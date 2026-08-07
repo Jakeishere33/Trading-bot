@@ -1,4 +1,5 @@
 import os
+import sys
 import gc
 import time
 import logging
@@ -7,7 +8,6 @@ from math import sqrt, log, exp, erf
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
 from flask import Flask
 
 from alpaca.trading.client import TradingClient
@@ -25,13 +25,30 @@ from alpaca.trading.enums import (
     ContractType,
 )
 from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import OptionLatestQuoteRequest, StockBarsRequest
 from alpaca.data.enums import OptionsFeed
+from alpaca.data.timeframe import TimeFrame
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    stream=sys.stdout,  # force stdout so Render's log tailer always captures it
+)
 log = logging.getLogger("lean_risk_engine")
 
 app = Flask(__name__)
+
+# Global flags so /health can report real status instead of just "the Flask
+# process is up" (which tells you nothing about whether the trading thread
+# is alive).
+ENGINE_STATE = {
+    "thread_started": False,
+    "thread_alive": False,
+    "last_cycle_started": None,
+    "last_cycle_finished": None,
+    "last_error": None,
+}
 
 
 @app.route("/")
@@ -41,7 +58,7 @@ def home():
 
 @app.route("/health")
 def health():
-    return "OK", 200
+    return ENGINE_STATE, 200
 
 
 # ============================================================
@@ -70,13 +87,6 @@ EQUITY_UNIVERSE = [
     "UNH", "PG", "HD", "COST",
 ]
 
-# ---- Sector-focused universe: semiconductors, industrial manufacturing,
-# pharma, and mining. Used by longs (satellite), shorts, AND the options
-# sleeve. Curated rather than a live Yahoo Finance sector screen: an
-# unbounded screen could return hundreds of tickers, which would blow the
-# 512 MB Render budget and hammer both Yahoo Finance and Alpaca with
-# requests every cycle. These lists cover liquid, optionable large-caps
-# in each sub-sector instead.
 SEMICONDUCTOR_TICKERS = [
     "NVDA", "AMD", "INTC", "TSM", "AVGO", "QCOM", "TXN", "MU", "LRCX", "AMAT",
 ]
@@ -104,8 +114,6 @@ def _dedupe(seq):
     return out
 
 
-# NVDA appears in both EQUITY_UNIVERSE and SEMICONDUCTOR_TICKERS — dedupe so
-# it isn't scanned/traded twice in the same cycle.
 SATELLITE_UNIVERSE = _dedupe(SECTOR_ETFS + EQUITY_UNIVERSE + SECTOR_EQUITY_UNIVERSE)
 
 SATELLITE_SLEEVE_WEIGHT = 0.20
@@ -116,9 +124,9 @@ TOP_N_SHORTS = 3
 
 HEDGE_SLEEVE_WEIGHT = 0.10
 HEDGE_INSTRUMENTS = {
-    "SH": 0.40,   # inverse equity
-    "TLT": 0.35,  # long duration bonds
-    "GLD": 0.25,  # gold
+    "SH": 0.40,
+    "TLT": 0.35,
+    "GLD": 0.25,
 }
 
 OPTIONS_ENABLED = True
@@ -127,8 +135,6 @@ PUT_OTM_PCT = 0.07
 OPTIONS_MIN_DTE = 25
 OPTIONS_MAX_DTE = 45
 COVERED_CALL_MIN_SHARES = 100
-# Options run on core ETFs plus the sector-focused universe (semiconductors,
-# manufacturing, pharma, mining) — same sector set now used by longs/shorts.
 OPTIONABLE_SYMBOLS = list(CORE_ETFS.keys()) + SECTOR_EQUITY_UNIVERSE
 
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
@@ -145,8 +151,7 @@ MAX_OPTION_SPREAD_PCT = 0.15
 
 REGIME_BENCHMARK = "VOO"
 
-# yfinance memory hygiene
-MAX_BARS_DAYS = 220  # never request more history than this for any calc
+MAX_BARS_DAYS = 220
 LOOP_SLEEP_SECONDS = 300
 
 # ============================================================
@@ -179,7 +184,7 @@ def reset_trade_counter_if_new_day():
 def can_trade_today():
     reset_trade_counter_if_new_day()
     if in_no_trade_window():
-        log.info("In no-trade window, skipping trades.")
+        log.info("In no-trade window (%s ET), skipping trades.", now_et().strftime("%H:%M"))
         return False
     return TRADES_TODAY < MAX_TRADES_PER_DAY
 
@@ -207,29 +212,37 @@ def assert_safe_order(symbol: str, asset_class):
 
 
 # ============================================================
-# YAHOO FINANCE — LIGHTWEIGHT, MEMORY-BOUNDED HELPERS
+# ALPACA MARKET DATA HELPERS (replaces yfinance)
 # ============================================================
-# Every call downloads only what it needs, extracts a plain list of floats,
-# then explicitly drops the DataFrame and forces a gc pass. This keeps peak
-# resident memory low enough to run comfortably inside a 512 MB Render plan.
+# yfinance frequently rate-limits or silently blocks requests coming from
+# cloud-host IP ranges (Render included), which used to fail closed:
+# every price came back as 0.0 and every sleeve quietly skipped trading
+# with nothing but a WARNING in the logs. Pulling bars from Alpaca instead
+# removes that failure point entirely, since it's the same authenticated
+# connection already used for trading.
 
-def yf_bars(symbol, days=60):
+def alpaca_bars(data_client, symbol, days=60):
     days = min(days, MAX_BARS_DAYS)
+    end = now_et()
+    start = end - timedelta(days=int(days * 1.6) + 5)  # pad for weekends/holidays
     try:
-        df = yf.download(
-            symbol,
-            period=f"{days}d",
-            interval="1d",
-            progress=False,
-            threads=False,
-            auto_adjust=True,
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=start,
+            end=end,
         )
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
         if df is None or df.empty:
             return []
-        closes = df["Close"].dropna().astype(float).tolist()
-        return closes
+        if symbol in df.index.get_level_values(0):
+            closes = df.loc[symbol]["close"].dropna().astype(float).tolist()
+        else:
+            closes = df["close"].dropna().astype(float).tolist()
+        return closes[-days:]
     except Exception as e:
-        log.warning("YF failed for %s: %s", symbol, e)
+        log.warning("Alpaca bars failed for %s: %s", symbol, e)
         return []
     finally:
         try:
@@ -239,20 +252,20 @@ def yf_bars(symbol, days=60):
         gc.collect()
 
 
-def latest_price(symbol):
-    bars = yf_bars(symbol, days=5)
+def latest_price(data_client, symbol):
+    bars = alpaca_bars(data_client, symbol, days=5)
     return bars[-1] if bars else 0.0
 
 
-def momentum(symbol, lookback=20):
-    bars = yf_bars(symbol, days=lookback + 5)
+def momentum(data_client, symbol, lookback=20):
+    bars = alpaca_bars(data_client, symbol, days=lookback + 5)
     if len(bars) < lookback + 1:
         return 0.0
     return (bars[-1] / bars[-lookback]) - 1.0
 
 
-def volatility(symbol, window=14):
-    bars = yf_bars(symbol, days=window + 10)
+def volatility(data_client, symbol, window=14):
+    bars = alpaca_bars(data_client, symbol, days=window + 10)
     if len(bars) < window + 1:
         return 0.0
     rets = []
@@ -271,8 +284,11 @@ def volatility(symbol, window=14):
 # ============================================================
 
 class LeanRiskManager:
+    def __init__(self, data_client):
+        self.data_client = data_client
+
     def regime_risk_score(self):
-        bars = yf_bars(REGIME_BENCHMARK, days=MAX_BARS_DAYS)
+        bars = alpaca_bars(self.data_client, REGIME_BENCHMARK, days=MAX_BARS_DAYS)
         if len(bars) < 200:
             return 0.3
         sma200 = sum(bars[-200:]) / 200
@@ -311,9 +327,10 @@ def bs_price(S, K, T, r, sigma, opt_type):
 # ============================================================
 
 class LeanOptionsEngine:
-    def __init__(self, trading_client, option_client):
+    def __init__(self, trading_client, option_client, data_client):
         self.trading = trading_client
         self.opt = option_client
+        self.data_client = data_client
 
     def find_contracts(self, underlying, contract_type):
         today = now_et().date()
@@ -370,7 +387,7 @@ class LeanOptionsEngine:
             return
         assert_safe_order(c.symbol, AssetClass.US_OPTION)
         T = (c.expiration_date - now_et().date()).days / TRADING_DAYS
-        sigma = max(volatility(underlying), 0.15)
+        sigma = max(volatility(self.data_client, underlying), 0.15)
         fair = bs_price(spot, float(c.strike_price), T, RISK_FREE_ANNUAL, sigma, "call")
         bid, ask = self.quote(c.symbol)
         if not self.liquidity_ok(c, bid, ask):
@@ -399,7 +416,7 @@ class LeanOptionsEngine:
             return
         assert_safe_order(c.symbol, AssetClass.US_OPTION)
         T = (c.expiration_date - now_et().date()).days / TRADING_DAYS
-        sigma = max(volatility(underlying), 0.15)
+        sigma = max(volatility(self.data_client, underlying), 0.15)
         fair = bs_price(spot, float(c.strike_price), T, RISK_FREE_ANNUAL, sigma, "put")
         bid, ask = self.quote(c.symbol)
         if not self.liquidity_ok(c, bid, ask):
@@ -425,16 +442,17 @@ class LeanOptionsEngine:
 # ============================================================
 
 class LeanTradingEngine:
-    def __init__(self, trading_client, option_client):
+    def __init__(self, trading_client, option_client, data_client):
         self.trading = trading_client
-        self.options = LeanOptionsEngine(trading_client, option_client)
-        self.risk = LeanRiskManager()
+        self.data_client = data_client
+        self.options = LeanOptionsEngine(trading_client, option_client, data_client)
+        self.risk = LeanRiskManager(data_client)
 
     def equity(self):
         try:
             return float(self.trading.get_account().equity)
         except Exception as e:
-            log.warning("Failed to fetch equity: %s", e)
+            log.error("Failed to fetch equity (account call is broken — check API keys/permissions): %s", e)
             return 0.0
 
     def positions(self):
@@ -460,46 +478,43 @@ class LeanTradingEngine:
         order = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY)
         submit_order_safe(self.trading, order, f"{label} {sym}")
 
-    # ---- core sleeve: broad-market ETFs, long only ----
     def run_core(self):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
         for sym, w in CORE_ETFS.items():
-            price = latest_price(sym)
+            price = latest_price(self.data_client, sym)
             if price <= 0:
                 continue
             self._rebalance_symbol(sym, eq * w, price, pos, "CORE")
 
-    # ---- satellite sleeve: top-momentum longs from ETFs + equities ----
     def run_satellite(self, scores=None):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
         if scores is None:
-            scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+            scores = {t: momentum(self.data_client, t, 60) for t in SATELLITE_UNIVERSE}
         top = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, -1e9), reverse=True)[:TOP_N_LONGS]
         per = SATELLITE_SLEEVE_WEIGHT / max(len(top), 1)
         for sym in top:
-            price = latest_price(sym)
+            price = latest_price(self.data_client, sym)
             if price <= 0:
                 continue
             self._rebalance_symbol(sym, eq * per, price, pos, "SAT")
 
-    # ---- short sleeve: worst-momentum names from ETFs + equities ----
     def run_shorts(self, scores=None):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
         if scores is None:
-            scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+            scores = {t: momentum(self.data_client, t, 60) for t in SATELLITE_UNIVERSE}
         worst = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, 1e9))[:TOP_N_SHORTS]
         per = SHORT_SLEEVE_WEIGHT / max(len(worst), 1)
         for sym in worst:
-            price = latest_price(sym)
+            price = latest_price(self.data_client, sym)
             if price <= 0:
                 continue
             target = eq * per
@@ -507,24 +522,22 @@ class LeanTradingEngine:
             if qty <= 0:
                 continue
             if sym in pos and float(pos[sym].qty) > 0:
-                continue  # don't short a name we're already long
+                continue
             assert_safe_order(sym, AssetClass.US_EQUITY)
             order = MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
             submit_order_safe(self.trading, order, f"SHORT {sym}")
 
-    # ---- hedge sleeve ----
     def run_hedges(self):
         eq = self.equity()
         if eq <= 0:
             return
         pos = self.positions()
         for sym, w in self.risk.hedge_weights().items():
-            price = latest_price(sym)
+            price = latest_price(self.data_client, sym)
             if price <= 0:
                 continue
             self._rebalance_symbol(sym, eq * w, price, pos, "HEDGE")
 
-    # ---- options sleeve: covered calls + protective puts on any long position ----
     def run_options(self):
         if not OPTIONS_ENABLED:
             return
@@ -537,8 +550,8 @@ class LeanTradingEngine:
                 continue
             shares = float(pos[sym].qty)
             if shares <= 0:
-                continue  # only write/hedge against long shares
-            price = latest_price(sym)
+                continue
+            price = latest_price(self.data_client, sym)
             if price <= 0:
                 continue
             if shares >= COVERED_CALL_MIN_SHARES:
@@ -546,16 +559,13 @@ class LeanTradingEngine:
             put_budget = eq * 0.01
             self.options.buy_protective_puts(sym, shares, price, put_budget)
 
-    # ---- main cycle ----
     def run_once(self):
         if not can_trade_today():
             return
         regime = self.risk.regime_risk_score()
         log.info("Regime risk score: %.2f", regime)
 
-        # Momentum scores are shared by the long and short sleeves so we hit
-        # Yahoo Finance once per symbol per cycle instead of twice.
-        momentum_scores = {t: momentum(t, 60) for t in SATELLITE_UNIVERSE}
+        momentum_scores = {t: momentum(self.data_client, t, 60) for t in SATELLITE_UNIVERSE}
 
         for label, fn in [
             ("core", self.run_core),
@@ -594,31 +604,71 @@ def _env_bool(name, default=True):
 
 
 def trading_loop():
+    ENGINE_STATE["thread_started"] = True
+    ENGINE_STATE["thread_alive"] = True
+
     api_key = os.getenv("ALPACA_API_KEY", "")
     api_secret = os.getenv("ALPACA_API_SECRET", "")
     paper = _env_bool("ALPACA_PAPER", True)
 
     if not api_key or not api_secret:
-        log.error("ALPACA_API_KEY / ALPACA_API_SECRET not set — trading loop will not start.")
+        msg = "ALPACA_API_KEY / ALPACA_API_SECRET not set in the environment — trading loop will NOT start."
+        log.error(msg)
+        ENGINE_STATE["last_error"] = msg
+        ENGINE_STATE["thread_alive"] = False
         return
 
-    trading_client = TradingClient(api_key, api_secret, paper=paper)
-    # Contract lookup goes through TradingClient; live quotes need the
-    # dedicated options market-data client — they are NOT the same object.
-    option_data_client = OptionHistoricalDataClient(api_key, api_secret)
+    log.info("Env vars found. paper=%s. Connecting to Alpaca...", paper)
 
-    engine = LeanTradingEngine(trading_client, option_data_client)
+    try:
+        trading_client = TradingClient(api_key, api_secret, paper=paper)
+        option_data_client = OptionHistoricalDataClient(api_key, api_secret)
+        stock_data_client = StockHistoricalDataClient(api_key, api_secret)
+
+        # Fail loud and fast at startup instead of discovering a bad key
+        # or wrong paper/live flag five minutes into silence.
+        account = trading_client.get_account()
+        log.info(
+            "Connected OK. account_status=%s equity=%s paper=%s",
+            account.status, account.equity, paper,
+        )
+    except Exception as e:
+        msg = f"Startup connection to Alpaca failed: {e}"
+        log.exception(msg)
+        ENGINE_STATE["last_error"] = msg
+        ENGINE_STATE["thread_alive"] = False
+        return
+
+    engine = LeanTradingEngine(trading_client, option_data_client, stock_data_client)
 
     while True:
+        ENGINE_STATE["last_cycle_started"] = now_et().isoformat()
         try:
             engine.run_once()
+            ENGINE_STATE["last_error"] = None
         except Exception as e:
             log.exception("Engine error: %s", e)
+            ENGINE_STATE["last_error"] = str(e)
+        ENGINE_STATE["last_cycle_finished"] = now_et().isoformat()
         gc.collect()
+        log.info("Cycle complete. Sleeping %ss.", LOOP_SLEEP_SECONDS)
         time.sleep(LOOP_SLEEP_SECONDS)
 
 
-threading.Thread(target=trading_loop, daemon=True).start()
+def _thread_wrapper():
+    try:
+        trading_loop()
+    except Exception as e:
+        # Belt-and-braces: if anything above escapes uncaught, the daemon
+        # thread would otherwise die completely silently with the Flask
+        # process staying "healthy" and no trades ever happening again.
+        log.exception("Trading thread crashed entirely: %s", e)
+        ENGINE_STATE["last_error"] = f"Thread crashed: {e}"
+        ENGINE_STATE["thread_alive"] = False
+
+
+threading.Thread(target=_thread_wrapper, daemon=True).start()
+log.info("Trading loop thread launched.")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 10000))
