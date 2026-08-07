@@ -27,7 +27,7 @@ from alpaca.trading.enums import (
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import OptionLatestQuoteRequest, StockBarsRequest
-from alpaca.data.enums import OptionsFeed
+from alpaca.data.enums import OptionsFeed, DataFeed
 from alpaca.data.timeframe import TimeFrame
 
 logging.basicConfig(
@@ -231,6 +231,12 @@ def alpaca_bars(data_client, symbol, days=60):
             timeframe=TimeFrame.Day,
             start=start,
             end=end,
+            # Free/basic Alpaca market-data plans only include the IEX feed.
+            # The client defaults to SIP, which requires a paid subscription
+            # and fails every single request with "subscription does not
+            # permit querying recent SIP data" — silently zeroing out every
+            # price in the engine. IEX is free and sufficient for daily bars.
+            feed=DataFeed.IEX,
         )
         bars = data_client.get_stock_bars(req)
         df = bars.df
