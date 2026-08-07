@@ -69,7 +69,44 @@ EQUITY_UNIVERSE = [
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "JPM", "XOM",
     "UNH", "PG", "HD", "COST",
 ]
-SATELLITE_UNIVERSE = SECTOR_ETFS + EQUITY_UNIVERSE  # keep this list bounded for memory
+
+# ---- Sector-focused universe: semiconductors, industrial manufacturing,
+# pharma, and mining. Used by longs (satellite), shorts, AND the options
+# sleeve. Curated rather than a live Yahoo Finance sector screen: an
+# unbounded screen could return hundreds of tickers, which would blow the
+# 512 MB Render budget and hammer both Yahoo Finance and Alpaca with
+# requests every cycle. These lists cover liquid, optionable large-caps
+# in each sub-sector instead.
+SEMICONDUCTOR_TICKERS = [
+    "NVDA", "AMD", "INTC", "TSM", "AVGO", "QCOM", "TXN", "MU", "LRCX", "AMAT",
+]
+MANUFACTURING_TICKERS = [
+    "CAT", "DE", "GE", "HON", "MMM", "ETN", "EMR", "ITW", "PH", "ROK",
+]
+PHARMA_TICKERS = [
+    "PFE", "JNJ", "MRK", "ABBV", "LLY", "BMY", "AMGN", "GILD", "VRTX", "REGN",
+]
+MINING_TICKERS = [
+    "FCX", "NEM", "GOLD", "SCCO", "AEM", "TECK", "RIO", "BHP", "VALE", "MOS",
+]
+SECTOR_EQUITY_UNIVERSE = (
+    SEMICONDUCTOR_TICKERS + MANUFACTURING_TICKERS + PHARMA_TICKERS + MINING_TICKERS
+)
+
+
+def _dedupe(seq):
+    seen = set()
+    out = []
+    for s in seq:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# NVDA appears in both EQUITY_UNIVERSE and SEMICONDUCTOR_TICKERS — dedupe so
+# it isn't scanned/traded twice in the same cycle.
+SATELLITE_UNIVERSE = _dedupe(SECTOR_ETFS + EQUITY_UNIVERSE + SECTOR_EQUITY_UNIVERSE)
 
 SATELLITE_SLEEVE_WEIGHT = 0.20
 TOP_N_LONGS = 4
@@ -90,7 +127,9 @@ PUT_OTM_PCT = 0.07
 OPTIONS_MIN_DTE = 25
 OPTIONS_MAX_DTE = 45
 COVERED_CALL_MIN_SHARES = 100
-OPTIONABLE_SYMBOLS = list(CORE_ETFS.keys())  # keep options sleeve small on purpose
+# Options run on core ETFs plus the sector-focused universe (semiconductors,
+# manufacturing, pharma, mining) — same sector set now used by longs/shorts.
+OPTIONABLE_SYMBOLS = list(CORE_ETFS.keys()) + SECTOR_EQUITY_UNIVERSE
 
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
 
@@ -485,7 +524,7 @@ class LeanTradingEngine:
                 continue
             self._rebalance_symbol(sym, eq * w, price, pos, "HEDGE")
 
-    # ---- options sleeve: covered calls + protective puts on core ETF holdings ----
+    # ---- options sleeve: covered calls + protective puts on any long position ----
     def run_options(self):
         if not OPTIONS_ENABLED:
             return
