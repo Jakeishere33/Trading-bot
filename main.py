@@ -9,76 +9,51 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from flask import Flask
-
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    MarketOrderRequest,
-    LimitOrderRequest,
-    GetOptionContractsRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    TimeInForce,
-    OrderType,
-    AssetClass,
-    AssetStatus,
-    ContractType,
-)
-from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import OptionLatestQuoteRequest, StockBarsRequest
-from alpaca.data.enums import OptionsFeed, DataFeed
-from alpaca.data.timeframe import TimeFrame
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, AssetClass
+
+import yfinance as yf
+
+# ------------------------------------------------------------
+# Logging / Flask / Engine state
+# ------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
-    stream=sys.stdout,  # force stdout so Render's log tailer always captures it
+    stream=sys.stdout,
 )
 log = logging.getLogger("lean_risk_engine")
 
 app = Flask(__name__)
 
-# Global flags so /health can report real status instead of just "the Flask
-# process is up" (which tells you nothing about whether the trading thread
-# is alive).
 ENGINE_STATE = {
     "thread_started": False,
     "thread_alive": False,
     "last_cycle_started": None,
     "last_cycle_finished": None,
     "last_error": None,
+    "trades_today": 0,
 }
-
 
 @app.route("/")
 def home():
-    return "Lean Global Multi-Factor Risk Engine Online", 200
-
+    return "Lean Short + Options Risk Engine Online", 200
 
 @app.route("/health")
 def health():
     return ENGINE_STATE, 200
 
-
-# ============================================================
-# CONFIG
-# ============================================================
+# ------------------------------------------------------------
+# Config
+# ------------------------------------------------------------
 
 EASTERN_TZ = ZoneInfo("America/New_York")
 
 RISK_FREE_ANNUAL = 0.04
 TRADING_DAYS = 252
 
-# ---- Core long-only sleeve (broad ETFs) ----
-CORE_ETFS = {
-    "VOO": 0.40,
-    "VXUS": 0.15,
-    "BND": 0.10,
-}
-CORE_TOTAL_WEIGHT = 0.65
-
-# ---- Satellite / short universe: sector ETFs + individual equities ----
 SECTOR_ETFS = [
     "XLK", "XLF", "XLV", "XLE", "XLI", "XLB", "XLY", "XLP", "XLU", "XLRE",
 ]
@@ -89,20 +64,24 @@ EQUITY_UNIVERSE = [
 
 SEMICONDUCTOR_TICKERS = [
     "NVDA", "AMD", "INTC", "TSM", "AVGO", "QCOM", "TXN", "MU", "LRCX", "AMAT",
+    "ADI", "KLAC", "MRVL", "ON", "MCHP", "SWKS", "QRVO", "NXPI", "TER", "ENTG",
+    "MPWR", "CRUS", "SLAB", "POWI", "DIOD", "RMBS", "ALGM", "WOLF", "ONTO", "COHU",
 ]
 MANUFACTURING_TICKERS = [
     "CAT", "DE", "GE", "HON", "MMM", "ETN", "EMR", "ITW", "PH", "ROK",
+    "DOV", "XYL", "IR", "AME", "ROP", "SNA", "SWK", "CMI", "PCAR", "FAST",
+    "GWW", "PNR", "FLS", "AOS", "NDSN", "ALLE", "IEX", "HUBB", "GGG", "CR",
 ]
 PHARMA_TICKERS = [
     "PFE", "JNJ", "MRK", "ABBV", "LLY", "BMY", "AMGN", "GILD", "VRTX", "REGN",
+    "BIIB", "ZTS", "MRNA", "ALNY", "INCY", "EXEL", "UTHR", "JAZZ", "RPRX", "SUPN",
+    "PCVX", "ARGX", "BMRN", "IONS", "NBIX", "HALO", "CRSP", "VTRS", "TEVA", "ELAN",
 ]
 MINING_TICKERS = [
     "FCX", "NEM", "GOLD", "SCCO", "AEM", "TECK", "RIO", "BHP", "VALE", "MOS",
+    "AA", "CLF", "X", "NUE", "STLD", "MP", "CDE", "HL", "PAAS", "AG",
+    "SSRM", "EGO", "KGC", "AU", "WPM", "FNV", "RGLD", "ALB", "LAC", "SQM",
 ]
-SECTOR_EQUITY_UNIVERSE = (
-    SEMICONDUCTOR_TICKERS + MANUFACTURING_TICKERS + PHARMA_TICKERS + MINING_TICKERS
-)
-
 
 def _dedupe(seq):
     seen = set()
@@ -113,33 +92,24 @@ def _dedupe(seq):
             out.append(s)
     return out
 
+SHORT_UNIVERSE = _dedupe(SECTOR_ETFS + EQUITY_UNIVERSE +
+                         SEMICONDUCTOR_TICKERS + MANUFACTURING_TICKERS +
+                         PHARMA_TICKERS + MINING_TICKERS)
+OPTIONABLE_SYMBOLS = SHORT_UNIVERSE
 
-SATELLITE_UNIVERSE = _dedupe(SECTOR_ETFS + EQUITY_UNIVERSE + SECTOR_EQUITY_UNIVERSE)
-
-SATELLITE_SLEEVE_WEIGHT = 0.20
-TOP_N_LONGS = 4
-
-SHORT_SLEEVE_WEIGHT = 0.12
-TOP_N_SHORTS = 6
-
-HEDGE_SLEEVE_WEIGHT = 0.10
-HEDGE_INSTRUMENTS = {
-    "SH": 0.40,
-    "TLT": 0.35,
-    "GLD": 0.25,
-}
+SHORT_SLEEVE_WEIGHT = 0.30
+TOP_N_SHORTS = 8
 
 OPTIONS_ENABLED = True
-CALL_OTM_PCT = 0.03
-PUT_OTM_PCT = 0.07
+HEDGE_CALL_OTM_PCT = 0.05
 OPTIONS_MIN_DTE = 25
 OPTIONS_MAX_DTE = 45
-COVERED_CALL_MIN_SHARES = 100
-OPTIONABLE_SYMBOLS = list(CORE_ETFS.keys()) + SECTOR_EQUITY_UNIVERSE
+OPTIONS_HEDGE_BUDGET_PCT = 0.05
 
 SAFE_ASSET_CLASSES = {AssetClass.US_EQUITY, AssetClass.US_OPTION}
 
 MAX_TRADES_PER_DAY = 300
+MIN_TRADES_PER_DAY = 3
 TRADES_TODAY = 0
 LAST_TRADE_DAY = None
 
@@ -154,13 +124,12 @@ REGIME_BENCHMARK = "VOO"
 MAX_BARS_DAYS = 220
 LOOP_SLEEP_SECONDS = 300
 
-# ============================================================
-# TIME / TRADE WINDOW
-# ============================================================
+# ------------------------------------------------------------
+# Time / trade window
+# ------------------------------------------------------------
 
 def now_et():
     return datetime.now(EASTERN_TZ)
-
 
 def in_no_trade_window():
     t = now_et()
@@ -171,15 +140,14 @@ def in_no_trade_window():
         return True
     return False
 
-
 def reset_trade_counter_if_new_day():
     global TRADES_TODAY, LAST_TRADE_DAY
     today = now_et().date()
     if LAST_TRADE_DAY != today:
         LAST_TRADE_DAY = today
         TRADES_TODAY = 0
+        ENGINE_STATE["trades_today"] = 0
         log.info("New trading day: trade counter reset.")
-
 
 def can_trade_today():
     reset_trade_counter_if_new_day()
@@ -188,67 +156,53 @@ def can_trade_today():
         return False
     return TRADES_TODAY < MAX_TRADES_PER_DAY
 
-
 def submit_order_safe(trading_client, order_data, label=""):
     global TRADES_TODAY
     reset_trade_counter_if_new_day()
     if TRADES_TODAY >= MAX_TRADES_PER_DAY:
         log.warning("Trade limit reached, skipping order: %s", label)
-        return
+        return False
     if in_no_trade_window():
         log.info("No-trade window active, skipping order: %s", label)
-        return
+        return False
     try:
         trading_client.submit_order(order_data=order_data)
         TRADES_TODAY += 1
-        log.info("Order submitted (%d/%d): %s", TRADES_TODAY, MAX_TRADES_PER_DAY, label)
+        ENGINE_STATE["trades_today"] = TRADES_TODAY
+        log.info("Order submitted (%d, min-per-day=%d): %s", TRADES_TODAY, MIN_TRADES_PER_DAY, label)
+        return True
     except Exception as e:
         log.exception("Order failed (%s): %s", label, e)
-
+        return False
 
 def assert_safe_order(symbol: str, asset_class):
     if asset_class not in SAFE_ASSET_CLASSES:
         raise ValueError(f"Blocked order for {symbol}: asset class {asset_class} not permitted.")
 
+# ------------------------------------------------------------
+# Market data (Yahoo Finance)
+# ------------------------------------------------------------
 
-# ============================================================
-# ALPACA MARKET DATA HELPERS (replaces yfinance)
-# ============================================================
-# yfinance frequently rate-limits or silently blocks requests coming from
-# cloud-host IP ranges (Render included), which used to fail closed:
-# every price came back as 0.0 and every sleeve quietly skipped trading
-# with nothing but a WARNING in the logs. Pulling bars from Alpaca instead
-# removes that failure point entirely, since it's the same authenticated
-# connection already used for trading.
+_YF_CACHE = {}
+_YF_CACHE_TTL_SECONDS = 60
 
-def alpaca_bars(data_client, symbol, days=60):
+def yf_bars(symbol, days=60):
     days = min(days, MAX_BARS_DAYS)
-    end = now_et()
-    start = end - timedelta(days=int(days * 1.6) + 5)  # pad for weekends/holidays
+    cache_key = (symbol, days)
+    cached = _YF_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < _YF_CACHE_TTL_SECONDS:
+        return cached[1]
+    period_days = int(days * 1.6) + 10
     try:
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            # Free/basic Alpaca market-data plans only include the IEX feed.
-            # The client defaults to SIP, which requires a paid subscription
-            # and fails every single request with "subscription does not
-            # permit querying recent SIP data" — silently zeroing out every
-            # price in the engine. IEX is free and sufficient for daily bars.
-            feed=DataFeed.IEX,
-        )
-        bars = data_client.get_stock_bars(req)
-        df = bars.df
-        if df is None or df.empty:
+        df = yf.Ticker(symbol).history(period=f"{period_days}d", interval="1d", auto_adjust=True)
+        if df is None or df.empty or "Close" not in df.columns:
             return []
-        if symbol in df.index.get_level_values(0):
-            closes = df.loc[symbol]["close"].dropna().astype(float).tolist()
-        else:
-            closes = df["close"].dropna().astype(float).tolist()
-        return closes[-days:]
+        closes = df["Close"].dropna().astype(float).tolist()
+        closes = closes[-days:]
+        _YF_CACHE[cache_key] = (time.time(), closes)
+        return closes
     except Exception as e:
-        log.warning("Alpaca bars failed for %s: %s", symbol, e)
+        log.warning("Yahoo Finance bars failed for %s: %s", symbol, e)
         return []
     finally:
         try:
@@ -257,21 +211,18 @@ def alpaca_bars(data_client, symbol, days=60):
             pass
         gc.collect()
 
-
-def latest_price(data_client, symbol):
-    bars = alpaca_bars(data_client, symbol, days=5)
+def latest_price(symbol):
+    bars = yf_bars(symbol, days=5)
     return bars[-1] if bars else 0.0
 
-
-def momentum(data_client, symbol, lookback=20):
-    bars = alpaca_bars(data_client, symbol, days=lookback + 5)
+def momentum(symbol, lookback=20):
+    bars = yf_bars(symbol, days=lookback + 5)
     if len(bars) < lookback + 1:
         return 0.0
     return (bars[-1] / bars[-lookback]) - 1.0
 
-
-def volatility(data_client, symbol, window=14):
-    bars = alpaca_bars(data_client, symbol, days=window + 10)
+def volatility(symbol, window=14):
+    bars = yf_bars(symbol, days=window + 10)
     if len(bars) < window + 1:
         return 0.0
     rets = []
@@ -284,17 +235,13 @@ def volatility(data_client, symbol, window=14):
     var = sum((r - mean) ** 2 for r in rets[-window:]) / window
     return sqrt(var) * sqrt(TRADING_DAYS)
 
-
-# ============================================================
-# REGIME / RISK MANAGER (LEAN)
-# ============================================================
+# ------------------------------------------------------------
+# Regime / risk manager
+# ------------------------------------------------------------
 
 class LeanRiskManager:
-    def __init__(self, data_client):
-        self.data_client = data_client
-
     def regime_risk_score(self):
-        bars = alpaca_bars(self.data_client, REGIME_BENCHMARK, days=MAX_BARS_DAYS)
+        bars = yf_bars(REGIME_BENCHMARK, days=MAX_BARS_DAYS)
         if len(bars) < 200:
             return 0.3
         sma200 = sum(bars[-200:]) / 200
@@ -305,17 +252,12 @@ class LeanRiskManager:
         dd_score = max(0.0, min(dd / 0.20, 1.0))
         return (below_sma + dd_score) / 2.0
 
-    def hedge_weights(self):
-        return {sym: HEDGE_SLEEVE_WEIGHT * pct for sym, pct in HEDGE_INSTRUMENTS.items()}
-
-
-# ============================================================
-# BLACK–SCHOLES (LEAN)
-# ============================================================
+# ------------------------------------------------------------
+# Black–Scholes
+# ------------------------------------------------------------
 
 def _cdf(x):
     return 0.5 * (1 + erf(x / sqrt(2)))
-
 
 def bs_price(S, K, T, r, sigma, opt_type):
     if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
@@ -327,138 +269,122 @@ def bs_price(S, K, T, r, sigma, opt_type):
     else:
         return K * exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
 
-
-# ============================================================
-# OPTIONS ENGINE (LEAN) — covered calls + protective puts only
-# ============================================================
+# ------------------------------------------------------------
+# Options engine (Yahoo Finance)
+# ------------------------------------------------------------
 
 class LeanOptionsEngine:
-    def __init__(self, trading_client, option_client, data_client):
+    def __init__(self, trading_client):
         self.trading = trading_client
-        self.opt = option_client
-        self.data_client = data_client
 
-    def find_contracts(self, underlying, contract_type):
-        today = now_et().date()
-        ctype = ContractType.CALL if contract_type == "call" else ContractType.PUT
-        req = GetOptionContractsRequest(
-            underlying_symbols=[underlying],
-            status=AssetStatus.ACTIVE,
-            type=ctype,
-            expiration_date_gte=today + timedelta(days=OPTIONS_MIN_DTE),
-            expiration_date_lte=today + timedelta(days=OPTIONS_MAX_DTE),
-        )
+    def yf_option_chain(self, underlying):
         try:
-            resp = self.trading.get_option_contracts(req)
-            return list(resp.option_contracts)
+            tk = yf.Ticker(underlying)
+            expirations = tk.options
+            chains = {}
+            today = now_et().date()
+            for exp in expirations:
+                try:
+                    exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                    dte = (exp_date - today).days
+                    if dte < OPTIONS_MIN_DTE or dte > OPTIONS_MAX_DTE:
+                        continue
+                    chain = tk.option_chain(exp)
+                    chains[exp_date] = chain.calls
+                except Exception:
+                    continue
+            return chains
         except Exception as e:
-            log.warning("Option contract lookup failed for %s: %s", underlying, e)
-            return []
+            log.warning("Yahoo option chain failed for %s: %s", underlying, e)
+            return {}
 
-    def quote(self, symbol):
-        try:
-            req = OptionLatestQuoteRequest(symbol_or_symbols=symbol, feed=OptionsFeed.INDICATIVE)
-            q = self.opt.get_option_latest_quote(req)[symbol]
-            return float(q.bid_price), float(q.ask_price)
-        except Exception as e:
-            log.warning("Option quote failed for %s: %s", symbol, e)
-            return None, None
+    def find_contracts(self, underlying):
+        chains = self.yf_option_chain(underlying)
+        out = []
+        for exp_date, df in chains.items():
+            for _, row in df.iterrows():
+                out.append({
+                    "symbol": row["contractSymbol"],
+                    "strike": float(row["strike"]),
+                    "expiration": exp_date,
+                    "bid": float(row.get("bid", 0) or 0),
+                    "ask": float(row.get("ask", 0) or 0),
+                    "volume": int(row.get("volume", 0) or 0),
+                })
+        return out
 
     def closest_strike(self, contracts, target):
         if not contracts:
             return None
         return sorted(
             contracts,
-            key=lambda c: (abs(float(c.strike_price) - target), c.expiration_date),
+            key=lambda c: (abs(c["strike"] - target), c["expiration"])
         )[0]
 
-    def liquidity_ok(self, contract, bid, ask):
-        vol = getattr(contract, "volume", None)
-        if vol is None or vol < MIN_OPTION_VOLUME:
+    def liquidity_ok(self, c):
+        if c["volume"] < MIN_OPTION_VOLUME:
             return False
-        if not bid or not ask or bid <= 0 or ask <= 0:
+        bid, ask = c["bid"], c["ask"]
+        if bid <= 0 or ask <= 0:
             return False
         mid = (bid + ask) / 2
         if mid <= 0:
             return False
         return (ask - bid) / mid <= MAX_OPTION_SPREAD_PCT
 
-    def sell_covered_calls(self, underlying, shares, spot):
-        if shares < COVERED_CALL_MIN_SHARES or spot <= 0:
-            return
-        contracts = self.find_contracts(underlying, "call")
-        target = spot * (1 + CALL_OTM_PCT)
-        c = self.closest_strike(contracts, target)
-        if not c:
-            return
-        assert_safe_order(c.symbol, AssetClass.US_OPTION)
-        T = (c.expiration_date - now_et().date()).days / TRADING_DAYS
-        sigma = max(volatility(self.data_client, underlying), 0.15)
-        fair = bs_price(spot, float(c.strike_price), T, RISK_FREE_ANNUAL, sigma, "call")
-        bid, ask = self.quote(c.symbol)
-        if not self.liquidity_ok(c, bid, ask):
-            return
-        use = bid if bid and bid > 0 else fair
-        qty = int(shares // 100)
-        if qty <= 0 or use <= 0:
-            return
-        order = LimitOrderRequest(
-            symbol=c.symbol,
-            qty=qty,
-            side=OrderSide.SELL,
-            type=OrderType.LIMIT,
-            time_in_force=TimeInForce.DAY,
-            limit_price=round(use, 2),
-        )
-        submit_order_safe(self.trading, order, f"SELL covered calls {c.symbol}")
+    def buy_protective_calls(self, underlying, shares_short, spot, budget):
+        if shares_short < 100 or budget <= 0 or spot <= 0:
+            return False
 
-    def buy_protective_puts(self, underlying, shares, spot, budget):
-        if shares < 100 or budget <= 0 or spot <= 0:
-            return
-        contracts = self.find_contracts(underlying, "put")
-        target = spot * (1 - PUT_OTM_PCT)
+        contracts = self.find_contracts(underlying)
+        if not contracts:
+            return False
+
+        target = spot * (1 + HEDGE_CALL_OTM_PCT)
         c = self.closest_strike(contracts, target)
         if not c:
-            return
-        assert_safe_order(c.symbol, AssetClass.US_OPTION)
-        T = (c.expiration_date - now_et().date()).days / TRADING_DAYS
-        sigma = max(volatility(self.data_client, underlying), 0.15)
-        fair = bs_price(spot, float(c.strike_price), T, RISK_FREE_ANNUAL, sigma, "put")
-        bid, ask = self.quote(c.symbol)
-        if not self.liquidity_ok(c, bid, ask):
-            return
-        use = ask if ask and ask > 0 else fair
+            return False
+
+        assert_safe_order(c["symbol"], AssetClass.US_OPTION)
+
+        T = (c["expiration"] - now_et().date()).days / TRADING_DAYS
+        sigma = max(volatility(underlying), 0.15)
+        fair = bs_price(spot, c["strike"], T, RISK_FREE_ANNUAL, sigma, "call")
+
+        use = c["ask"] if c["ask"] > 0 else fair
+        if use <= 0:
+            return False
+
         max_aff = int(budget // (use * 100))
-        qty = min(int(shares // 100), max_aff)
-        if qty <= 0 or use <= 0:
-            return
+        qty = min(int(shares_short // 100), max_aff)
+        if qty <= 0:
+            return False
+
         order = LimitOrderRequest(
-            symbol=c.symbol,
+            symbol=c["symbol"],
             qty=qty,
             side=OrderSide.BUY,
             type=OrderType.LIMIT,
             time_in_force=TimeInForce.DAY,
             limit_price=round(use, 2),
         )
-        submit_order_safe(self.trading, order, f"BUY protective puts {c.symbol}")
+        return submit_order_safe(self.trading, order, f"BUY protective calls {c['symbol']}")
 
-
-# ============================================================
-# MAIN TRADING ENGINE
-# ============================================================
+# ------------------------------------------------------------
+# Main trading engine
+# ------------------------------------------------------------
 
 class LeanTradingEngine:
-    def __init__(self, trading_client, option_client, data_client):
+    def __init__(self, trading_client):
         self.trading = trading_client
-        self.data_client = data_client
-        self.options = LeanOptionsEngine(trading_client, option_client, data_client)
-        self.risk = LeanRiskManager(data_client)
+        self.options = LeanOptionsEngine(trading_client)
+        self.risk = LeanRiskManager()
 
     def equity(self):
         try:
             return float(self.trading.get_account().equity)
         except Exception as e:
-            log.error("Failed to fetch equity (account call is broken — check API keys/permissions): %s", e)
+            log.error("Failed to fetch equity: %s", e)
             return 0.0
 
     def positions(self):
@@ -468,102 +394,84 @@ class LeanTradingEngine:
             log.warning("Failed to fetch positions: %s", e)
             return {}
 
-    def _rebalance_symbol(self, sym, target_value, price, pos, label):
-        cur = float(pos.get(sym).market_value) if sym in pos else 0.0
-        diff = target_value - cur
-        if target_value == 0 and cur == 0:
-            return
-        eq = max(self.equity(), 1.0)
-        if abs(diff) / eq < 0.01:
-            return
-        side = OrderSide.BUY if diff > 0 else OrderSide.SELL
-        qty = int(abs(diff) / price)
+    def _open_short(self, sym, price, target_value):
+        qty = int(target_value / price)
         if qty <= 0:
-            return
+            return False
         assert_safe_order(sym, AssetClass.US_EQUITY)
-        order = MarketOrderRequest(symbol=sym, qty=qty, side=side, time_in_force=TimeInForce.DAY)
-        submit_order_safe(self.trading, order, f"{label} {sym}")
+        order = MarketOrderRequest(
+            symbol=sym,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        )
+        return submit_order_safe(self.trading, order, f"SHORT {sym}")
 
-    def run_core(self):
+    def run_shorts(self, scores, regime, rank_offset=0, extra=0):
         eq = self.equity()
         if eq <= 0:
-            return
+            return 0
         pos = self.positions()
-        for sym, w in CORE_ETFS.items():
-            price = latest_price(self.data_client, sym)
-            if price <= 0:
-                continue
-            self._rebalance_symbol(sym, eq * w, price, pos, "CORE")
-
-    def run_satellite(self, scores=None):
-        eq = self.equity()
-        if eq <= 0:
-            return
-        pos = self.positions()
-        if scores is None:
-            scores = {t: momentum(self.data_client, t, 60) for t in SATELLITE_UNIVERSE}
-        top = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, -1e9), reverse=True)[:TOP_N_LONGS]
-        per = SATELLITE_SLEEVE_WEIGHT / max(len(top), 1)
-        for sym in top:
-            price = latest_price(self.data_client, sym)
-            if price <= 0:
-                continue
-            self._rebalance_symbol(sym, eq * per, price, pos, "SAT")
-
-    def run_shorts(self, scores=None):
-        eq = self.equity()
-        if eq <= 0:
-            return
-        pos = self.positions()
-        if scores is None:
-            scores = {t: momentum(self.data_client, t, 60) for t in SATELLITE_UNIVERSE}
-        worst = sorted(SATELLITE_UNIVERSE, key=lambda x: scores.get(x, 1e9))[:TOP_N_SHORTS]
-        per = SHORT_SLEEVE_WEIGHT / max(len(worst), 1)
-        for sym in worst:
-            price = latest_price(self.data_client, sym)
-            if price <= 0:
-                continue
-            target = eq * per
-            qty = int(target / price)
-            if qty <= 0:
+        ranked = sorted(SHORT_UNIVERSE, key=lambda x: scores.get(x, 1e9))
+        n = TOP_N_SHORTS + extra
+        candidates = ranked[rank_offset:rank_offset + n]
+        per = (SHORT_SLEEVE_WEIGHT / max(TOP_N_SHORTS, 1)) * (0.5 + regime)
+        placed = 0
+        for sym in candidates:
+            if sym in pos and float(pos[sym].qty) < 0:
                 continue
             if sym in pos and float(pos[sym].qty) > 0:
                 continue
-            assert_safe_order(sym, AssetClass.US_EQUITY)
-            order = MarketOrderRequest(symbol=sym, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-            submit_order_safe(self.trading, order, f"SHORT {sym}")
-
-    def run_hedges(self):
-        eq = self.equity()
-        if eq <= 0:
-            return
-        pos = self.positions()
-        for sym, w in self.risk.hedge_weights().items():
-            price = latest_price(self.data_client, sym)
+            price = latest_price(sym)
             if price <= 0:
                 continue
-            self._rebalance_symbol(sym, eq * w, price, pos, "HEDGE")
+            if self._open_short(sym, price, eq * per):
+                placed += 1
+        return placed
 
     def run_options(self):
         if not OPTIONS_ENABLED:
-            return
+            return 0
         eq = self.equity()
         if eq <= 0:
-            return
+            return 0
         pos = self.positions()
-        for sym in OPTIONABLE_SYMBOLS:
-            if sym not in pos:
+        budget_total = eq * OPTIONS_HEDGE_BUDGET_PCT
+        shorts = [(s, p) for s, p in pos.items() if float(p.qty) < 0 and s in OPTIONABLE_SYMBOLS]
+        if not shorts:
+            return 0
+        budget_each = budget_total / len(shorts)
+        placed = 0
+        for sym, p in shorts:
+            shares_short = abs(float(p.qty))
+            if shares_short < 100:
                 continue
-            shares = float(pos[sym].qty)
-            if shares <= 0:
-                continue
-            price = latest_price(self.data_client, sym)
+            price = latest_price(sym)
             if price <= 0:
                 continue
-            if shares >= COVERED_CALL_MIN_SHARES:
-                self.options.sell_covered_calls(sym, shares, price)
-            put_budget = eq * 0.01
-            self.options.buy_protective_puts(sym, shares, price, put_budget)
+            if self.options.buy_protective_calls(sym, shares_short, price, budget_each):
+                placed += 1
+        return placed
+
+    def ensure_minimum_trades(self, momentum_scores, regime):
+        global TRADES_TODAY
+        offset = TOP_N_SHORTS
+        attempts = 0
+        max_attempts = len(SHORT_UNIVERSE)
+        while TRADES_TODAY < MIN_TRADES_PER_DAY and attempts < max_attempts:
+            if not can_trade_today():
+                break
+            placed = self.run_shorts(momentum_scores, regime, rank_offset=offset, extra=0)
+            if placed == 0:
+                offset += TOP_N_SHORTS
+            attempts += TOP_N_SHORTS
+            if offset >= len(SHORT_UNIVERSE):
+                break
+        if TRADES_TODAY < MIN_TRADES_PER_DAY:
+            log.warning(
+                "Could not reach MIN_TRADES_PER_DAY (%d/%d) — universe/no-trade window exhausted.",
+                TRADES_TODAY, MIN_TRADES_PER_DAY,
+            )
 
     def run_once(self):
         if not can_trade_today():
@@ -571,43 +479,35 @@ class LeanTradingEngine:
         regime = self.risk.regime_risk_score()
         log.info("Regime risk score: %.2f", regime)
 
-        momentum_scores = {t: momentum(self.data_client, t, 60) for t in SATELLITE_UNIVERSE}
+        momentum_scores = {t: momentum(t, 60) for t in SHORT_UNIVERSE}
 
-        for label, fn in [
-            ("core", self.run_core),
-            ("satellite", lambda: self.run_satellite(momentum_scores)),
-            ("hedges", self.run_hedges),
-        ]:
-            try:
-                fn()
-            except Exception as e:
-                log.exception("Sleeve '%s' failed, continuing: %s", label, e)
-
-        if regime > 0.15:
-            try:
-                self.run_shorts(momentum_scores)
-            except Exception as e:
-                log.exception("Sleeve 'shorts' failed, continuing: %s", e)
+        try:
+            self.run_shorts(momentum_scores, regime)
+        except Exception as e:
+            log.exception("Sleeve 'shorts' failed: %s", e)
 
         try:
             self.run_options()
         except Exception as e:
-            log.exception("Sleeve 'options' failed, continuing: %s", e)
+            log.exception("Sleeve 'options' failed: %s", e)
+
+        try:
+            self.ensure_minimum_trades(momentum_scores, regime)
+        except Exception as e:
+            log.exception("ensure_minimum_trades failed: %s", e)
 
         del momentum_scores
         gc.collect()
 
-
-# ============================================================
-# BACKGROUND LOOP FOR RENDER
-# ============================================================
+# ------------------------------------------------------------
+# Background loop
+# ------------------------------------------------------------
 
 def _env_bool(name, default=True):
     val = os.getenv(name)
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
-
 
 def trading_loop():
     ENGINE_STATE["thread_started"] = True
@@ -618,7 +518,7 @@ def trading_loop():
     paper = _env_bool("ALPACA_PAPER", True)
 
     if not api_key or not api_secret:
-        msg = "ALPACA_API_KEY / ALPACA_API_SECRET not set in the environment — trading loop will NOT start."
+        msg = "ALPACA_API_KEY / ALPACA_API_SECRET not set — trading loop will NOT start."
         log.error(msg)
         ENGINE_STATE["last_error"] = msg
         ENGINE_STATE["thread_alive"] = False
@@ -628,11 +528,6 @@ def trading_loop():
 
     try:
         trading_client = TradingClient(api_key, api_secret, paper=paper)
-        option_data_client = OptionHistoricalDataClient(api_key, api_secret)
-        stock_data_client = StockHistoricalDataClient(api_key, api_secret)
-
-        # Fail loud and fast at startup instead of discovering a bad key
-        # or wrong paper/live flag five minutes into silence.
         account = trading_client.get_account()
         log.info(
             "Connected OK. account_status=%s equity=%s paper=%s",
@@ -645,7 +540,7 @@ def trading_loop():
         ENGINE_STATE["thread_alive"] = False
         return
 
-    engine = LeanTradingEngine(trading_client, option_data_client, stock_data_client)
+    engine = LeanTradingEngine(trading_client)
 
     while True:
         ENGINE_STATE["last_cycle_started"] = now_et().isoformat()
@@ -660,18 +555,13 @@ def trading_loop():
         log.info("Cycle complete. Sleeping %ss.", LOOP_SLEEP_SECONDS)
         time.sleep(LOOP_SLEEP_SECONDS)
 
-
 def _thread_wrapper():
     try:
         trading_loop()
     except Exception as e:
-        # Belt-and-braces: if anything above escapes uncaught, the daemon
-        # thread would otherwise die completely silently with the Flask
-        # process staying "healthy" and no trades ever happening again.
-        log.exception("Trading thread crashed entirely: %s", e)
+        log.exception("Trading thread crashed: %s", e)
         ENGINE_STATE["last_error"] = f"Thread crashed: {e}"
         ENGINE_STATE["thread_alive"] = False
-
 
 threading.Thread(target=_thread_wrapper, daemon=True).start()
 log.info("Trading loop thread launched.")
