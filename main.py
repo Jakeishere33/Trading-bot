@@ -2,12 +2,14 @@ import os
 import sys
 import gc
 import time
+import random
 import logging
 import threading
 from math import sqrt, log as ln, exp, erf
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import requests
 from flask import Flask
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
@@ -35,6 +37,7 @@ ENGINE_STATE = {
     "last_cycle_finished": None,
     "last_error": None,
     "trades_today": 0,
+    "market_open": None,
 }
 
 @app.route("/")
@@ -113,6 +116,7 @@ MIN_TRADES_PER_DAY = 5
 TRADES_TODAY = 0
 LAST_TRADE_DAY = None
 
+# Fallback ET window, only used if the Alpaca clock call itself fails.
 NO_TRADE_BEFORE = (4, 0)
 NO_TRADE_AFTER = (20, 0)
 
@@ -124,6 +128,56 @@ REGIME_BENCHMARK = "VOO"
 MAX_BARS_DAYS = 220
 LOOP_SLEEP_SECONDS = 60
 
+# yfinance resilience settings
+YF_MAX_RETRIES = 3
+YF_RETRY_BASE_DELAY = 1.5  # seconds, exponential backoff w/ jitter
+
+# ------------------------------------------------------------
+# Resilient Yahoo Finance session
+# ------------------------------------------------------------
+# Cloud/datacenter IPs (Render, AWS, etc.) get rate-limited or blocked by
+# Yahoo more aggressively than residential IPs. A normal browser User-Agent
+# plus retries with backoff clears the vast majority of these failures.
+
+_YF_SESSION = requests.Session()
+_YF_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+})
+
+def _yf_ticker(symbol):
+    try:
+        return yf.Ticker(symbol, session=_YF_SESSION)
+    except TypeError:
+        # Some yfinance versions don't accept a session kwarg on Ticker.
+        return yf.Ticker(symbol)
+
+def _with_retries(fn, label):
+    last_exc = None
+    for attempt in range(1, YF_MAX_RETRIES + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if attempt < YF_MAX_RETRIES:
+                delay = YF_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                delay += random.uniform(0, 0.5)
+                log.warning(
+                    "Yahoo Finance call failed (%s) attempt %d/%d: %s — retrying in %.1fs",
+                    label, attempt, YF_MAX_RETRIES, e, delay,
+                )
+                time.sleep(delay)
+            else:
+                log.warning(
+                    "Yahoo Finance call failed (%s) after %d attempts: %s",
+                    label, YF_MAX_RETRIES, e,
+                )
+    if last_exc:
+        raise last_exc
+
 # ------------------------------------------------------------
 # Time / trade window
 # ------------------------------------------------------------
@@ -131,7 +185,8 @@ LOOP_SLEEP_SECONDS = 60
 def now_et():
     return datetime.now(EASTERN_TZ)
 
-def in_no_trade_window():
+def _fallback_in_no_trade_window():
+    """Only used if the Alpaca clock API can't be reached."""
     t = now_et()
     h, m = t.hour, t.minute
     if (h < NO_TRADE_BEFORE[0]) or (h == NO_TRADE_BEFORE[0] and m < NO_TRADE_BEFORE[1]):
@@ -139,6 +194,31 @@ def in_no_trade_window():
     if (h > NO_TRADE_AFTER[0]) or (h == NO_TRADE_AFTER[0] and m >= NO_TRADE_AFTER[1]):
         return True
     return False
+
+_CLOCK_CACHE = {"ts": 0.0, "is_open": None}
+_CLOCK_CACHE_TTL_SECONDS = 30
+
+def market_is_open(trading_client):
+    """
+    Ask Alpaca whether the market is actually open right now. This is the
+    authoritative source (handles weekends, holidays, and early closes),
+    unlike a hardcoded hour window.
+    """
+    now = time.time()
+    if _CLOCK_CACHE["is_open"] is not None and (now - _CLOCK_CACHE["ts"]) < _CLOCK_CACHE_TTL_SECONDS:
+        return _CLOCK_CACHE["is_open"]
+    try:
+        clock = trading_client.get_clock()
+        is_open = bool(clock.is_open)
+        _CLOCK_CACHE["ts"] = now
+        _CLOCK_CACHE["is_open"] = is_open
+        ENGINE_STATE["market_open"] = is_open
+        return is_open
+    except Exception as e:
+        log.warning("Failed to fetch Alpaca market clock: %s — using ET fallback window.", e)
+        fallback = not _fallback_in_no_trade_window()
+        ENGINE_STATE["market_open"] = fallback
+        return fallback
 
 def reset_trade_counter_if_new_day():
     global TRADES_TODAY, LAST_TRADE_DAY
@@ -149,10 +229,10 @@ def reset_trade_counter_if_new_day():
         ENGINE_STATE["trades_today"] = 0
         log.info("New trading day: trade counter reset.")
 
-def can_trade_today():
+def can_trade_today(trading_client):
     reset_trade_counter_if_new_day()
-    if in_no_trade_window():
-        log.info("In no-trade window (%s ET), skipping trades.", now_et().strftime("%H:%M"))
+    if not market_is_open(trading_client):
+        log.info("Market closed (Alpaca clock), skipping trades.")
         return False
     return TRADES_TODAY < MAX_TRADES_PER_DAY
 
@@ -162,8 +242,8 @@ def submit_order_safe(trading_client, order_data, label=""):
     if TRADES_TODAY >= MAX_TRADES_PER_DAY:
         log.warning("Trade limit reached, skipping order: %s", label)
         return False
-    if in_no_trade_window():
-        log.info("No-trade window active, skipping order: %s", label)
+    if not market_is_open(trading_client):
+        log.info("Market closed, skipping order: %s", label)
         return False
     try:
         trading_client.submit_order(order_data=order_data)
@@ -193,16 +273,21 @@ def yf_bars(symbol, days=60):
     if cached and (time.time() - cached[0]) < _YF_CACHE_TTL_SECONDS:
         return cached[1]
     period_days = int(days * 1.6) + 10
-    try:
-        df = yf.Ticker(symbol).history(period=f"{period_days}d", interval="1d", auto_adjust=True)
+
+    def _fetch():
+        df = _yf_ticker(symbol).history(period=f"{period_days}d", interval="1d", auto_adjust=True)
         if df is None or df.empty or "Close" not in df.columns:
-            return []
+            raise ValueError("empty or malformed dataframe")
+        return df
+
+    try:
+        df = _with_retries(_fetch, f"history:{symbol}")
         closes = df["Close"].dropna().astype(float).tolist()
         closes = closes[-days:]
         _YF_CACHE[cache_key] = (time.time(), closes)
         return closes
     except Exception as e:
-        log.warning("Yahoo Finance bars failed for %s: %s", symbol, e)
+        log.warning("Yahoo Finance bars failed for %s after retries: %s", symbol, e)
         return []
     finally:
         try:
@@ -279,8 +364,8 @@ class LeanOptionsEngine:
 
     def yf_option_chain(self, underlying):
         try:
-            tk = yf.Ticker(underlying)
-            expirations = tk.options
+            tk = _yf_ticker(underlying)
+            expirations = _with_retries(lambda: tk.options, f"options:{underlying}")
             chains = {}
             today = now_et().date()
             for exp in expirations:
@@ -289,7 +374,7 @@ class LeanOptionsEngine:
                     dte = (exp_date - today).days
                     if dte < OPTIONS_MIN_DTE or dte > OPTIONS_MAX_DTE:
                         continue
-                    chain = tk.option_chain(exp)
+                    chain = _with_retries(lambda: tk.option_chain(exp), f"option_chain:{underlying}:{exp}")
                     chains[exp_date] = chain.calls
                 except Exception:
                     continue
@@ -459,7 +544,7 @@ class LeanTradingEngine:
         attempts = 0
         max_attempts = len(SHORT_UNIVERSE)
         while TRADES_TODAY < MIN_TRADES_PER_DAY and attempts < max_attempts:
-            if not can_trade_today():
+            if not can_trade_today(self.trading):
                 break
             placed = self.run_shorts(momentum_scores, regime, rank_offset=offset, extra=0)
             if placed == 0:
@@ -474,7 +559,7 @@ class LeanTradingEngine:
             )
 
     def run_once(self):
-        if not can_trade_today():
+        if not can_trade_today(self.trading):
             return
         regime = self.risk.regime_risk_score()
         log.info("Regime risk score: %.2f", regime)
