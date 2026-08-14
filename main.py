@@ -78,12 +78,6 @@ SECTOR_ETFS = [
     "XLB", "XLY", "XLP", "XLU", "XLRE",
 ]
 
-EQUITY_UNIVERSE = [
-    "AAPL", "MSFT", "NVDA", "AMZN",
-    "GOOGL", "META", "JPM", "XOM",
-    "UNH", "PG", "HD", "COST",
-]
-
 SEMICONDUCTOR_TICKERS = [
     "NVDA", "AMD", "INTC", "TSM", "AVGO",
     "QCOM", "TXN", "MU", "LRCX", "AMAT",
@@ -102,15 +96,6 @@ MANUFACTURING_TICKERS = [
     "ALLE", "IEX", "HUBB", "GGG", "CR",
 ]
 
-PHARMA_TICKERS = [
-    "PFE", "JNJ", "MRK", "ABBV", "LLY",
-    "BMY", "AMGN", "GILD", "VRTX", "REGN",
-    "BIIB", "ZTS", "MRNA", "ALNY", "INCY",
-    "EXEL", "UTHR", "JAZZ", "RPRX", "SUPN",
-    "PCVX", "ARGX", "BMRN", "IONS", "NBIX",
-    "HALO", "CRSP", "VTRS", "TEVA", "ELAN",
-]
-
 MINING_TICKERS = [
     "FCX", "NEM", "GOLD", "SCCO", "AEM",
     "TECK", "RIO", "BHP", "VALE", "MOS",
@@ -118,6 +103,30 @@ MINING_TICKERS = [
     "MP", "CDE", "HL", "PAAS", "AG",
     "SSRM", "EGO", "KGC", "AU", "WPM",
     "FNV", "RGLD", "ALB", "LAC", "SQM",
+]
+
+# Mid/large-cap E&P, refining, midstream, and oilfield-services names.
+# Excludes XOM/CVX (mega-cap) and any ticker that has been delisted
+# via merger (e.g. HES -> Chevron, MRO/PXD -> ConocoPhillips/Exxon).
+ENERGY_TICKERS = [
+    "COP", "EOG", "OXY", "MPC", "PSX",
+    "VLO", "WMB", "OKE", "KMI", "TRGP",
+    "DVN", "FANG", "HAL", "SLB", "BKR",
+    "APA", "CTRA", "EQT", "PBF", "DINO",
+    "CVI", "PARR", "DK", "CHRD", "MTDR",
+    "AR", "RRC", "SM", "NOG", "TALO",
+]
+
+# Transportation/logistics, aerospace parts, waste/environmental
+# services, and building-products names -- distinct from the
+# heavy-machinery names already covered in MANUFACTURING_TICKERS.
+INDUSTRIALS_TICKERS = [
+    "WAB", "JBHT", "ODFL", "XPO", "CHRW",
+    "LSTR", "EXPD", "WERN", "SAIA", "RXO",
+    "TXT", "HEI", "TDG", "CW", "WWD",
+    "AXON", "LII", "WSO", "JCI", "CSL",
+    "MAS", "VMC", "MLM", "WM", "RSG",
+    "CTAS", "ROL", "PWR", "FIX", "EME",
 ]
 
 
@@ -137,14 +146,22 @@ def _dedupe(seq):
 
 SHORT_UNIVERSE = _dedupe(
     SECTOR_ETFS
-    + EQUITY_UNIVERSE
     + SEMICONDUCTOR_TICKERS
     + MANUFACTURING_TICKERS
-    + PHARMA_TICKERS
     + MINING_TICKERS
+    + ENERGY_TICKERS
+    + INDUSTRIALS_TICKERS
 )
 
 OPTIONABLE_SYMBOLS = set(SHORT_UNIVERSE)
+
+# Symbols in these three sectors get preferential treatment when
+# picking short candidates (see PRIORITY_MIN_SLOTS below).
+PRIORITY_SECTOR_TICKERS = set(
+    SEMICONDUCTOR_TICKERS
+    + MANUFACTURING_TICKERS
+    + MINING_TICKERS
+)
 
 
 # ============================================================
@@ -152,7 +169,14 @@ OPTIONABLE_SYMBOLS = set(SHORT_UNIVERSE)
 # ============================================================
 
 SHORT_SLEEVE_WEIGHT = 0.30
-TOP_N_SHORTS = 8
+TOP_N_SHORTS = 20
+
+# Of the TOP_N_SHORTS slots, reserve this many for the weakest
+# semiconductor / manufacturing / mining names before filling the
+# rest of the book from the overall ranked list (ETFs, energy,
+# industrials, or leftover priority names). Set to 0 to disable
+# the tilt.
+PRIORITY_MIN_SLOTS = 12
 
 OPTIONS_ENABLED = True
 
@@ -163,12 +187,23 @@ OPTIONS_MAX_DTE = 45
 
 OPTIONS_HEDGE_BUDGET_PCT = 0.05
 
-MAX_TRADES_PER_DAY = 300
+# Hard cap on how many option contracts can be bought for any single
+# underlying in one pass of run_options(), regardless of how much
+# budget/short size would otherwise allow.
+MAX_OPTION_CONTRACTS_PER_TICKER = 3
 
-# IMPORTANT:
-# Do not force trades just because a minimum was not reached.
-# This prevents bad trades during data outages.
-MIN_TRADES_PER_DAY = 0
+# No ceiling on trades per day -- set to None to disable the cap
+# entirely (submit_order_safe / can_trade_today treat None as
+# "unlimited").
+MAX_TRADES_PER_DAY = None
+
+# The engine will keep opening additional shorts (from the next-best
+# ranked momentum candidates, never arbitrary picks) after the normal
+# sleeve + options passes if the day's trade count hasn't reached
+# this floor yet. It stops early if it simply runs out of valid,
+# not-already-held candidates -- it will not fabricate trades against
+# missing/bad data.
+MIN_TRADES_PER_DAY = 20
 
 TRADES_TODAY = 0
 LAST_TRADE_DAY = None
@@ -1482,6 +1517,7 @@ class LeanOptionsEngine:
         qty = min(
             contracts_by_shares,
             max_affordable,
+            MAX_OPTION_CONTRACTS_PER_TICKER,
         )
 
         if qty <= 0:
@@ -1728,7 +1764,8 @@ def can_trade_today(
         return False
 
     return (
-        TRADES_TODAY
+        MAX_TRADES_PER_DAY is None
+        or TRADES_TODAY
         < MAX_TRADES_PER_DAY
     )
 
@@ -1748,7 +1785,8 @@ def submit_order_safe(
     reset_trade_counter_if_new_day()
 
     if (
-        TRADES_TODAY
+        MAX_TRADES_PER_DAY is not None
+        and TRADES_TODAY
         >= MAX_TRADES_PER_DAY
     ):
         log.warning(
@@ -1947,6 +1985,32 @@ class LeanTradingEngine:
     # SHORT STRATEGY
     # --------------------------------------------------------
 
+    def _target_short_size(
+        self,
+        eq,
+        regime,
+    ):
+
+        per_position = (
+            SHORT_SLEEVE_WEIGHT
+            / max(
+                TOP_N_SHORTS,
+                1,
+            )
+        )
+
+        # Slightly increase size in higher-risk regimes.
+        regime_multiplier = (
+            0.5
+            + regime
+        )
+
+        return (
+            eq
+            * per_position
+            * regime_multiplier
+        )
+
     def run_shorts(
         self,
         scores,
@@ -1983,28 +2047,46 @@ class LeanTradingEngine:
             key=lambda x: scores[x],
         )
 
-        candidates = ranked[
-            :TOP_N_SHORTS
+        # Reserve slots for the weakest priority-sector names first
+        # (semiconductors / manufacturing / mining), then backfill
+        # any remaining slots from the overall ranked list so the
+        # book still fills out to TOP_N_SHORTS even if there aren't
+        # enough priority-sector candidates on a given day.
+        priority_ranked = [
+            symbol
+            for symbol in ranked
+            if symbol in PRIORITY_SECTOR_TICKERS
         ]
 
-        per_position = (
-            SHORT_SLEEVE_WEIGHT
-            / max(
-                TOP_N_SHORTS,
-                1,
-            )
+        candidates = priority_ranked[
+            :PRIORITY_MIN_SLOTS
+        ]
+
+        remaining_slots = (
+            TOP_N_SHORTS
+            - len(candidates)
         )
 
-        # Slightly increase size in higher-risk regimes.
-        regime_multiplier = (
-            0.5
-            + regime
-        )
+        if remaining_slots > 0:
+
+            chosen = set(candidates)
+
+            backfill = [
+                symbol
+                for symbol in ranked
+                if symbol not in chosen
+            ]
+
+            candidates = (
+                candidates
+                + backfill[:remaining_slots]
+            )
 
         target_per_position = (
-            eq
-            * per_position
-            * regime_multiplier
+            self._target_short_size(
+                eq,
+                regime,
+            )
         )
 
         placed = 0
@@ -2042,6 +2124,108 @@ class LeanTradingEngine:
                 symbol,
                 scores[symbol] * 100,
                 price,
+            )
+
+            if self._open_short(
+                symbol,
+                price,
+                target_per_position,
+            ):
+                placed += 1
+
+        return placed
+
+    # --------------------------------------------------------
+    # TOP-UP TO DAILY MINIMUM
+    # --------------------------------------------------------
+
+    def top_up_to_minimum(
+        self,
+        scores,
+        regime,
+        prices,
+    ):
+        """
+        If the day's trade count is still below MIN_TRADES_PER_DAY
+        after the normal short + options passes, keep opening shorts
+        in the next-best momentum names (never already-held symbols,
+        never symbols without real data) until the minimum is met or
+        the ranked list runs out.
+        """
+
+        reset_trade_counter_if_new_day()
+
+        still_needed = (
+            MIN_TRADES_PER_DAY
+            - TRADES_TODAY
+        )
+
+        if still_needed <= 0:
+            return 0
+
+        eq = self.equity()
+
+        if eq <= 0:
+            return 0
+
+        positions = self.positions()
+
+        valid_symbols = [
+            symbol
+            for symbol in SHORT_UNIVERSE
+            if scores.get(symbol) is not None
+            and prices.get(symbol, 0) > 0
+            and symbol not in positions
+        ]
+
+        if not valid_symbols:
+            log.info(
+                "Below daily trade minimum (%d/%d) but no "
+                "additional valid candidates remain.",
+                TRADES_TODAY,
+                MIN_TRADES_PER_DAY,
+            )
+            return 0
+
+        ranked = sorted(
+            valid_symbols,
+            key=lambda x: scores[x],
+        )
+
+        target_per_position = (
+            self._target_short_size(
+                eq,
+                regime,
+            )
+        )
+
+        placed = 0
+
+        for symbol in ranked:
+
+            if (
+                TRADES_TODAY
+                >= MIN_TRADES_PER_DAY
+            ):
+                break
+
+            price = prices.get(
+                symbol,
+                0.0,
+            )
+
+            if price <= 0:
+                continue
+
+            log.info(
+                "TOP-UP short candidate %s | "
+                "momentum=%.2f%% price=%.2f "
+                "(trades today=%d, min=%d)",
+                symbol,
+                scores[symbol] * 100,
+                price,
+                TRADES_TODAY,
+                MIN_TRADES_PER_DAY,
             )
 
             if self._open_short(
@@ -2260,7 +2444,31 @@ class LeanTradingEngine:
             )
 
         # ----------------------------------------------------
-        # NO FORCED TRADES
+        # TOP UP TO DAILY MINIMUM
+        #
+        # Only pulls from real, ranked momentum candidates that
+        # aren't already held -- never fabricated or random trades.
+        # Stops naturally if there simply aren't enough valid
+        # candidates left (e.g. widespread data outage).
+        # ----------------------------------------------------
+
+        try:
+
+            self.top_up_to_minimum(
+                momentum_scores,
+                regime,
+                prices,
+            )
+
+        except Exception as exc:
+
+            log.exception(
+                "Trade top-up failed: %s",
+                exc,
+            )
+
+        # ----------------------------------------------------
+        # CYCLE SUMMARY
         # ----------------------------------------------------
 
         log.info(
